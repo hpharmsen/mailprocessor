@@ -1,0 +1,19 @@
+{
+  "id": "anth-msg-1",
+  "threadId": "anth-thread-1",
+  "payload": {
+    "headers": [
+      {"name": "From", "value": "invoice+statements@mail.anthropic.com"},
+      {"name": "Subject", "value": "Your Anthropic invoice"},
+      {"name": "Date", "value": "Tue, 03 Jun 2026 12:00:00 +0000"},
+      {"name": "Message-Id", "value": "<xyz789@mail.anthropic.com>"}
+    ],
+    "parts": [
+      {
+        "filename": "Invoice-2026-05.pdf",
+        "mimeType": "application/pdf",
+        "body": {"attachmentId": "att-anth-1", "size": 5432}
+      }
+    ]
+  }
+}

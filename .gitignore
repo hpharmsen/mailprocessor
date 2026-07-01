@@ -1,0 +1,9 @@
+.env
+credentials.json
+token.json
+tasks.md
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+launchd/*.log

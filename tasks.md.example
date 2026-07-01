@@ -1,0 +1,37 @@
+# tasks.md — voorbeeldregels
+
+Kopieer dit bestand naar `tasks.md` en pas aan. De agent leest `tasks.md` bij
+elke run; nieuwe regel toevoegen betekent alleen dit bestand bewerken (mits
+target-paden binnen `ALLOWED_ROOTS` in `disk.py` vallen).
+
+Per afzender: één H2-kop met de naam van de partij, gevolgd door de match-regels
+en de stappen die de agent moet uitvoeren. Placeholders zoals `[JAAR]`,
+`{yyyy}`, `{mm}` worden door de agent ingevuld.
+
+---
+
+## Voorbeeld-attachment-flow
+
+Als een mail binnenkomt van `facturen@voorbeeld.nl`
+en hij heeft een attachment die begint met 'Factuur' doe dan de volgende stappen:
+1. Sla de attachment op in `/Users/jij/Documenten/[JAAR]/rekeningen/Voorbeeld-[NAAM VAN DE PDF]`.
+2. Markeer de mail als gelezen.
+3. Stuur `jij@voorbeeld.nl` een reply met de melding dat het bestand is opgeslagen en waar.
+
+## Voorbeeld-maandrapport-flow
+
+Als een mail komt van `rapporten@partner.nl` met een Excel-attachment waarvan
+de naam begint met "Partner Resultaat", doe het volgende:
+1. Sla op in `/Users/jij/Investeringen/Partner/{yyyy}-{mm}.pdf` (yyyy/mm uit de attachment-naam).
+2. Markeer de mail als gelezen.
+3. Stuur `jij@voorbeeld.nl` een reply-melding.
+
+## Voorbeeld-browser-flow
+
+Als een mail komt van `_noreply@leverancier.nl` met titel "Je factuur staat klaar", doe:
+1. Open de browser via `browser_open` op de "Bekijk factuur"-link uit de mail.
+2. Log in met `browser_fill_credential` (env-vars `LEVERANCIER_USER` / `LEVERANCIER_PASSWORD`), klik login.
+3. Wacht op de verificatiemail met `wait_for_email(sender='_noreply@leverancier.nl', subject_contains='verificatiecode', timeout_seconds=120)`.
+4. Vul de code met `browser_fill`, bevestig.
+5. Download de factuur met `browser_download`.
+6. Roep `apply_downloaded` aan met source_path, target_path, rule_name en reply_body — die markeert de mail als gelezen, stuurt de reply en zet het done-label.

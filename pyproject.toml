@@ -1,0 +1,30 @@
+[project]
+name = 'mailprocessor'
+version = '0.1.0'
+description = 'Auto-saves Gmail attachments per tasks.md rules via a justai agent.'
+requires-python = '>=3.13'
+dependencies = [
+    'justai>=5.4.0',
+    'justlog',
+    'python-dotenv>=1.2.1',
+    'google-api-python-client>=2.130.0',
+    'google-auth-oauthlib>=1.2.0',
+    'google-auth-httplib2>=0.2.0',
+    'pypdf>=4.0.0',
+    "playwright>=1.60.0",
+]
+
+[tool.uv.sources]
+justlog = { path = '/Users/hp/proj/justlog', editable = true }
+justai = { path = '/Users/hp/proj/justai', editable = true }
+
+[dependency-groups]
+dev = [
+    'pytest>=8.0',
+    'pytest-mock>=3.12',
+    'pytest-asyncio>=0.23',
+]
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+asyncio_mode = 'auto'

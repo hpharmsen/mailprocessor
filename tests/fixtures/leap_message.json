@@ -1,0 +1,24 @@
+{
+  "id": "leap-msg-1",
+  "threadId": "leap-thread-1",
+  "payload": {
+    "headers": [
+      {"name": "From", "value": "Pelle Schlichting <pelle.schlichting@leap24.eu>"},
+      {"name": "Subject", "value": "Monthly Report May 2026"},
+      {"name": "Date", "value": "Fri, 12 Jun 2026 09:00:00 +0200"},
+      {"name": "Message-Id", "value": "<abc123@leap24.eu>"}
+    ],
+    "parts": [
+      {
+        "filename": "",
+        "mimeType": "text/plain",
+        "body": {"data": "aGVsbG8="}
+      },
+      {
+        "filename": "Monthly Report May 2026.pdf",
+        "mimeType": "application/pdf",
+        "body": {"attachmentId": "att-leap-1", "size": 12345}
+      }
+    ]
+  }
+}
