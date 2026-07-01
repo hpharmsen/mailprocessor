@@ -2,7 +2,7 @@
 
 ## Overzicht
 
-Uurlijkse launchd-job die Gmail leest, attachments van vooraf-bekende afzenders
+Uurlijkse cron-job die Gmail leest, attachments van vooraf-bekende afzenders
 opslaat op disk volgens regels uit `tasks.md`, een justai-agent inzet voor
 rule-matching + placeholder-substitutie, en Gmail-labels gebruikt als enige
 persistente state.
@@ -12,16 +12,18 @@ persistente state.
 ```
 mailprocessor/
 ├── pyproject.toml                  # workspace member; deps incl. justai/justlog (lokale paths)
-├── tasks.md                        # door HP onderhouden regels (input)
-├── main.py                         # entry point + SMTP-notify + setup-auth subcommand
-├── task_parser.py                  # extract_senders(content) -> set[str]
-├── gmail_client.py                 # OAuth + Gmail-operaties + MailContext
-├── disk.py                         # save_attachment_bytes met ALLOWED_ROOTS-guard
-├── agent_runner.py                 # justai-agent + tool-closures per mail
-├── launchd/
-│   └── com.harmsen.mailprocessor.plist
+├── tasks.md                        # door HP onderhouden regels (input, gitignored)
+├── tasks.md.example                # gesanitiseerd voorbeeld voor de repo
+├── .env                            # NOTIFY_TO + secrets (gitignored)
+├── src/
+│   ├── main.py                     # entry point + SMTP-notify + setup-auth subcommand
+│   ├── task_parser.py              # extract_senders(content) -> set[str]
+│   ├── gmail_client.py             # OAuth + Gmail-operaties + MailContext
+│   ├── disk.py                     # save_attachment_bytes met ALLOWED_ROOTS-guard
+│   ├── browser_tools.py            # playwright-tools voor browser-flows
+│   └── agent_runner.py             # justai-agent + tool-closures per mail
 └── tests/
-    ├── conftest.py                 # path + justlog setup
+    ├── conftest.py                 # sys.path + NOTIFY_TO + justlog setup
     ├── test_task_parser.py
     ├── test_disk.py
     ├── test_gmail_client.py
@@ -32,7 +34,7 @@ mailprocessor/
 ## Runtime flow
 
 ```
-launchd (Minute=0)
+cron (hourly)
    |-> main.run()
         |-> load_credentials() (auto-refresh; chmod 600 na write)
         |-> GmailClient.ensure_labels()
@@ -81,7 +83,7 @@ launchd (Minute=0)
 | Re-delivery van zelfde rapport (zelfde bytes)            | Content-hash check -> `identical-already-present`, geen false-failure     |
 | Overwrite van bestaand bestand met verschillende inhoud  | `TargetExistsError` -> failed-label + notify                              |
 | CRLF-injectie in `From`-header (BCC-spoofing)            | `parseaddr` + expliciete `\r\n`-check in `get_message`                    |
-| Auto-reply naar externe afzender                         | `send_reply` hardcodeert `To: hp@harmsen.nl` (`NOTIFY_TO`)                |
+| Auto-reply naar externe afzender                         | `send_reply` gebruikt `NOTIFY_TO` (env-var, geladen uit `.env`)            |
 | Token-leak via wereld-leesbare `token.json`              | `chmod 600` na elke `write` in `load_credentials` + `run_oauth_flow`      |
 | Secrets in repo                                          | `.gitignore` sluit `.env`, `credentials.json`, `token.json` uit            |
 | Logs bevatten subject-lines                              | Logs in `~/Library/Logs/mailprocessor/`, niet in repo                     |
@@ -96,7 +98,7 @@ launchd (Minute=0)
 - **OAuth-refresh fails** -> SMTP-notify ("run setup-auth") + exit 1.
 - **Gmail-query fails** (network down) -> SMTP-notify + exit 1. Volgende cron-tick
   probeert opnieuw.
-- **SMTP-notifier zelf faalt** -> alleen gelogd; launchd stderr-log vangt op.
+- **SMTP-notifier zelf faalt** -> alleen gelogd; cron log vangt op.
 
 ## State-transitions
 
@@ -118,9 +120,7 @@ opnieuw aanbieden: verwijder het failed-label handmatig en kickstart.
   rotation. `lg.info/error/warning` ondersteunen kwargs; `lg.exception`
   niet -- gebruik `lg.error(..., exc_info=True)`.
 - **`google-api-python-client`** + **`google-auth-*`** -- Gmail API + OAuth.
-- **launchd** -- `StartCalendarInterval` (coalesceert na sleep, ipv
-  `StartInterval` dat ticks mist), expliciete `PATH`/`HOME` zodat `uv` cache
-  vindt.
+- **cron** (HP's eigen scheduler) -- uurlijks: `0 * * * *`.
 
 ## Wat is bewust *niet* gebouwd
 

@@ -1,8 +1,8 @@
 '''mailprocessor entry point.
 
 Two modes:
-  uv run main.py             # the cron run
-  uv run main.py setup-auth  # interactive OAuth bootstrap
+  uv run src/main.py             # the cron run
+  uv run src/main.py setup-auth  # interactive OAuth bootstrap
 '''
 import asyncio
 import os
@@ -13,16 +13,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from dotenv import load_dotenv
-from google.auth.exceptions import RefreshError
-from justlog import lg, setup_logging
 
-import agent_runner
-import task_parser
-from gmail_client import (
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / '.env')
+
+from google.auth.exceptions import RefreshError  # noqa: E402
+from justlog import lg, setup_logging  # noqa: E402
+
+import agent_runner  # noqa: E402
+import task_parser  # noqa: E402
+from gmail_client import (  # noqa: E402
     GmailClient, NoValidTokenError, load_credentials, run_oauth_flow, NOTIFY_TO,
 )
 
-ROOT = Path(__file__).parent
 TOKEN_PATH = ROOT / 'token.json'
 CREDENTIALS_PATH = ROOT / 'credentials.json'
 TASKS_MD_PATH = ROOT / 'tasks.md'
@@ -50,14 +53,13 @@ def email_error(subject: str, body: str) -> None:
 
 async def run() -> int:
     setup_logging(str(LOG_PATH), max_bytes=1_000_000, backup_count=5)
-    load_dotenv(ROOT / '.env')
 
     try:
         creds = load_credentials(TOKEN_PATH, CREDENTIALS_PATH)
     except (NoValidTokenError, RefreshError) as e:
         email_error(
             'mailprocessor: OAuth needs re-bootstrap',
-            f'Run: cd {ROOT} && uv run main.py setup-auth\n\nDetail: {e}\n',
+            f'Run: cd {ROOT} && uv run src/main.py setup-auth\n\nDetail: {e}\n',
         )
         lg.error('oauth bootstrap required', error=str(e))
         return 1

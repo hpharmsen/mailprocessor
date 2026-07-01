@@ -15,7 +15,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
-NOTIFY_TO = 'hp@harmsen.nl'
+NOTIFY_TO = os.environ['NOTIFY_TO']
 DONE_LABEL = 'mailprocessor/done'
 FAILED_LABEL = 'mailprocessor/failed'
 
@@ -51,7 +51,7 @@ def load_credentials(token_path: Path, credentials_path: Path) -> Credentials:
         token_path.write_text(creds.to_json())
         os.chmod(token_path, 0o600)
     if not creds or not creds.valid:
-        raise NoValidTokenError(f'Run `uv run main.py setup-auth` first (token at {token_path}).')
+        raise NoValidTokenError(f'Run `uv run src/main.py setup-auth` first (token at {token_path}).')
     return creds
 
 
@@ -308,7 +308,7 @@ class GmailClient:
     # --- sending ---------------------------------------------------------
 
     def send_reply(self, mail_ctx: MailContext, body: str) -> None:
-        '''Send a reply within mail_ctx's thread to NOTIFY_TO (hardcoded).'''
+        '''Send a reply within mail_ctx's thread to NOTIFY_TO (from .env).'''
         msg = EmailMessage()
         msg['To'] = NOTIFY_TO
         msg['From'] = NOTIFY_TO

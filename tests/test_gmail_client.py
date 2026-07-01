@@ -7,7 +7,7 @@ import pytest
 from conftest import FIXTURES
 
 import gmail_client
-from gmail_client import GmailClient, MailContext, InvalidSenderError, DONE_LABEL, FAILED_LABEL
+from gmail_client import GmailClient, MailContext, InvalidSenderError, DONE_LABEL, FAILED_LABEL, NOTIFY_TO
 
 
 @pytest.fixture
@@ -102,7 +102,7 @@ def test_send_reply_to_is_notify_to_not_sender(client, svc):
     raw_b64 = send_call.kwargs['body']['raw']
     raw = base64.urlsafe_b64decode(raw_b64).decode()
     headers_section = raw.split('\n\n', 1)[0]
-    assert 'To: hp@harmsen.nl' in headers_section
+    assert f'To: {NOTIFY_TO}' in headers_section
     assert 'someone@external.com' not in headers_section
 
 

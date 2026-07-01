@@ -1,6 +1,6 @@
 # mailprocessor
 
-Een uurlijkse launchd-job die Gmail leest, attachments van vooraf-bekende afzenders
+Een uurlijkse cron-job die Gmail leest, attachments van vooraf-bekende afzenders
 opslaat op disk volgens regels uit `tasks.md`, een justai-agent inzet voor
 rule-matching + placeholder-substitutie, en Gmail-labels gebruikt als enige
 persistente state.
@@ -24,12 +24,18 @@ uv sync
 mkdir -p ~/Library/Logs/mailprocessor
 ```
 
-`.env` moet `EMAIL_PASSWORD_HP` bevatten voor de SMTP-fallback (failure notifications).
+`.env` moet minstens bevatten:
+
+- `NOTIFY_TO` — e-mailadres waar alle replies en foutmeldingen naartoe gaan.
+- `EMAIL_PASSWORD_HP` — Gmail app-password voor de SMTP-fallback (failure notifications).
+
+Overige env-vars (bv. `ODIDO_USER` / `ODIDO_PASSWORD`) zijn alleen nodig voor
+regels die die credentials via `browser_fill_credential` gebruiken.
 
 ### 3. OAuth bootstrap
 
 ```bash
-uv run main.py setup-auth
+uv run src/main.py setup-auth
 ```
 
 Opent een browser. Accepteer de "unverified app" warning. `token.json` wordt
@@ -38,28 +44,17 @@ weggeschreven met mode 0600.
 ### 4. Handmatig testen
 
 ```bash
-uv run main.py
+uv run src/main.py
 ```
 
 ### 5. Schedulen via `cron` (HP's eigen scheduler)
 
 ```bash
-cron add "0 * * * *" "/Users/hp/proj/research/.venv/bin/python /Users/hp/proj/research/mailprocessor/main.py"
+cron add "0 * * * *" "/Users/hp/proj/research/.venv/bin/python /Users/hp/proj/research/mailprocessor/src/main.py"
 cron list                          # noteer ID
 cron rename <id> Mailprocessor
 cron run <id>                      # forceer een directe run
 cron log <id>                      # bekijk laatste output
-```
-
-#### Alternatief: launchd
-
-Als je de standalone launchd-route prefereert (geen afhankelijkheid van `cron`):
-
-```bash
-cp launchd/com.harmsen.mailprocessor.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.harmsen.mailprocessor.plist
-launchctl print gui/$(id -u)/com.harmsen.mailprocessor      # verifieer
-launchctl kickstart -k gui/$(id -u)/com.harmsen.mailprocessor  # forceer een run
 ```
 
 ## Nieuwe regel toevoegen
@@ -71,12 +66,10 @@ niet runtime-configureerbaar zijn).
 
 ## Troubleshooting
 
-- **Token expired / RefreshError** -> SMTP-notify komt binnen. Run `uv run main.py setup-auth`.
+- **Token expired / RefreshError** -> SMTP-notify komt binnen. Run `uv run src/main.py setup-auth`.
 - **Mail met failed-label** -> check `~/Library/Logs/mailprocessor/app.log`, fix
   oorzaak, verwijder het `mailprocessor/failed`-label in Gmail, en kickstart de job.
 - **Cron job lijkt niet te lopen** -> `cron show <id>` toont last_run + status; `cron log <id>` toont laatste output.
-- **launchd job lijkt niet te lopen** -> `launchctl print gui/$(id -u)/com.harmsen.mailprocessor`
-  toont laatste exit code + last-run-time.
 
 ## Tests
 
