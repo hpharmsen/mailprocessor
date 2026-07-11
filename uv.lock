@@ -847,8 +847,8 @@ wheels = [
 
 [[package]]
 name = "justlog"
-version = "0.7.6"
-source = { editable = "/Users/hp/proj/justlog" }
+version = "0.8.2"
+source = { git = "https://github.com/hpharmsen/justlog.git?rev=0.8.2#02a500117bccb055469a0d1759f03d81aaebb042" }
 
 [[package]]
 name = "lxml"
@@ -940,7 +940,7 @@ requires-dist = [
     { name = "google-auth-httplib2", specifier = ">=0.2.0" },
     { name = "google-auth-oauthlib", specifier = ">=1.2.0" },
     { name = "justai", editable = "/Users/hp/proj/justai" },
-    { name = "justlog", editable = "/Users/hp/proj/justlog" },
+    { name = "justlog", git = "https://github.com/hpharmsen/justlog.git?rev=0.8.2" },
     { name = "playwright", specifier = ">=1.60.0" },
     { name = "pypdf", specifier = ">=4.0.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },

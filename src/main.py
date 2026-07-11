@@ -54,6 +54,10 @@ def email_error(subject: str, body: str) -> None:
 async def run() -> int:
     setup_logging(str(LOG_PATH), max_bytes=1_000_000, backup_count=5)
 
+    if os.getenv('JANITOR_ERRORS') == '1':
+        from justlog.handlers import JanitorWebhookHandler
+        lg.addHandler(JanitorWebhookHandler(project='mailprocessor'))
+
     try:
         creds = load_credentials(TOKEN_PATH, CREDENTIALS_PATH)
     except (NoValidTokenError, RefreshError) as e:
