@@ -5,7 +5,7 @@ description = 'Auto-saves Gmail attachments per tasks.md rules via a justai agen
 requires-python = '>=3.13'
 dependencies = [
     'justai>=5.4.0',
-    'justlog @ git+https://github.com/hpharmsen/justlog.git@0.8.2',
+    'justlog @ git+https://github.com/hpharmsen/justlog.git@0.8.3',
     'python-dotenv>=1.2.1',
     'google-api-python-client>=2.130.0',
     'google-auth-oauthlib>=1.2.0',
