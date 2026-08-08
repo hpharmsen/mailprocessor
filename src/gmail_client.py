@@ -9,15 +9,19 @@ from email.utils import parseaddr
 from html.parser import HTMLParser
 from pathlib import Path
 
+from google.auth.exceptions import TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from justlog import lg
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 NOTIFY_TO = os.environ['NOTIFY_TO']
 DONE_LABEL = 'mailprocessor/done'
 FAILED_LABEL = 'mailprocessor/failed'
+REFRESH_ATTEMPTS = 2
+REFRESH_BACKOFF_SECONDS = 2.0
 
 
 class NoValidTokenError(Exception):
@@ -47,7 +51,16 @@ def load_credentials(token_path: Path, credentials_path: Path) -> Credentials:
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        for attempt in range(1, REFRESH_ATTEMPTS + 1):
+            try:
+                creds.refresh(Request())
+                break
+            except TransportError as e:
+                if attempt == REFRESH_ATTEMPTS:
+                    lg.error('oauth token refresh failed after retries', error=str(e), attempts=attempt)
+                    raise
+                lg.warning('oauth token refresh failed, retrying', error=str(e), attempt=attempt)
+                time.sleep(REFRESH_BACKOFF_SECONDS)
         token_path.write_text(creds.to_json())
         os.chmod(token_path, 0o600)
     if not creds or not creds.valid:

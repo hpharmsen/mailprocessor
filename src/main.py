@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / '.env')
 
-from google.auth.exceptions import RefreshError  # noqa: E402
+from google.auth.exceptions import RefreshError, TransportError  # noqa: E402
 from justlog import lg, setup_logging  # noqa: E402
 
 import agent_runner  # noqa: E402
@@ -60,6 +60,9 @@ async def run() -> int:
 
     try:
         creds = load_credentials(TOKEN_PATH, CREDENTIALS_PATH)
+    except TransportError as e:
+        lg.error('oauth token refresh failed (transient network error)', error=str(e))
+        return 1
     except (NoValidTokenError, RefreshError) as e:
         email_error(
             'mailprocessor: OAuth needs re-bootstrap',
