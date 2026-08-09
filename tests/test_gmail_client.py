@@ -199,3 +199,67 @@ def test_add_label_uses_cached_id(client, svc):
     client.add_label('m1', DONE_LABEL)
     call = svc.users().messages().modify.call_args
     assert call.kwargs['body'] == {'addLabelIds': ['L_done_cached']}
+
+
+# --- transient-failure retry -------------------------------------------------
+
+def _http_error(status: int):
+    resp = MagicMock()
+    resp.status = status
+    return gmail_client.HttpError(resp=resp, content=b'boom')
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    '''Keep the backoff out of the test runtime.'''
+    monkeypatch.setattr(gmail_client.time, 'sleep', lambda _s: None)
+
+
+@pytest.mark.parametrize('exc', [
+    _http_error(429),
+    _http_error(503),
+    TimeoutError('ReadTimeout'),
+    ConnectionResetError('connection reset'),
+    gmail_client.httplib2.error.ServerNotFoundError('dns'),
+])
+def test_execute_retries_transient_then_succeeds(exc, no_sleep):
+    request = MagicMock()
+    request.execute.side_effect = [exc, {'ok': True}]
+    assert gmail_client._execute(request, 'thing') == {'ok': True}
+    assert request.execute.call_count == 2
+
+
+@pytest.mark.parametrize('exc', [_http_error(404), _http_error(403), ValueError('bug')])
+def test_execute_does_not_retry_permanent_errors(exc, no_sleep):
+    request = MagicMock()
+    request.execute.side_effect = exc
+    with pytest.raises(type(exc)):
+        gmail_client._execute(request, 'thing')
+    assert request.execute.call_count == 1
+
+
+def test_execute_gives_up_after_last_attempt_and_reraises(no_sleep):
+    request = MagicMock()
+    request.execute.side_effect = TimeoutError('ReadTimeout')
+    with pytest.raises(TimeoutError):
+        gmail_client._execute(request, 'thing')
+    assert request.execute.call_count == gmail_client.RETRY_ATTEMPTS
+
+
+def test_execute_logs_warning_per_retry_not_error(no_sleep, monkeypatch):
+    warnings, errors = [], []
+    monkeypatch.setattr(gmail_client.lg, 'warning', lambda *a, **kw: warnings.append(a))
+    monkeypatch.setattr(gmail_client.lg, 'error', lambda *a, **kw: errors.append(a))
+    request = MagicMock()
+    request.execute.side_effect = [TimeoutError('x'), TimeoutError('x'), {'ok': True}]
+    gmail_client._execute(request, 'thing')
+    # Two retries logged as WARNING; the ERROR (and Janitor alert) stays with the caller.
+    assert len(warnings) == 2
+    assert errors == []
+
+
+def test_query_pending_survives_one_transient_failure(client, svc, no_sleep):
+    svc.users().messages().list().execute.side_effect = [
+        _http_error(503), {'messages': [{'id': 'm1'}]},
+    ]
+    assert client.query_pending({'a@b.com'}) == ['m1']

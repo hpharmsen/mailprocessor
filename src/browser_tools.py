@@ -200,7 +200,7 @@ def make_browser_open(session: BrowserSession) -> Callable:
             return session.submit(_do)
         except Exception as exc:
             shot = session.submit(_save_screenshot_sync, 'open-fail') if session._started else None
-            lg.error('browser_open failed', url=url, error=str(exc), screenshot=shot)
+            lg.error('browser_open failed', url=url, exc_info=exc, screenshot=shot)
             return f'error: {type(exc).__name__}: {exc}'
     return browser_open
 
@@ -239,7 +239,7 @@ def make_browser_click(session: BrowserSession) -> Callable:
             return r.get('snapshot') or f'error: {r.get("error")}'
         except Exception as exc:
             shot = session.submit(_save_screenshot_sync, f'click-fail-{target[:30]}')
-            lg.error('browser_click failed', target=target, error=str(exc), screenshot=shot)
+            lg.error('browser_click failed', target=target, exc_info=exc, screenshot=shot)
             return f'error: {type(exc).__name__}: {exc}'
     return browser_click
 
@@ -260,7 +260,7 @@ def make_browser_fill(session: BrowserSession) -> Callable:
         try:
             return session.submit(_do)
         except Exception as exc:
-            lg.error('browser_fill failed', target=target, error=str(exc))
+            lg.error('browser_fill failed', target=target, exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
     return browser_fill
 
@@ -285,7 +285,7 @@ def make_browser_fill_credential(session: BrowserSession) -> Callable:
         try:
             return session.submit(_do)
         except Exception as exc:
-            lg.error('browser_fill_credential failed', target=target, error=str(exc))
+            lg.error('browser_fill_credential failed', target=target, exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
     return browser_fill_credential
 
@@ -323,7 +323,7 @@ def make_browser_fill_otp(session: BrowserSession) -> Callable:
         try:
             return session.submit(_do)
         except Exception as exc:
-            lg.error('browser_fill_otp failed', error=str(exc))
+            lg.error('browser_fill_otp failed', exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
     return browser_fill_otp
 
@@ -351,7 +351,7 @@ def make_browser_download(session: BrowserSession) -> Callable:
         try:
             return session.submit(_do)
         except Exception as exc:
-            lg.error('browser_download failed', target=target, error=str(exc))
+            lg.error('browser_download failed', target=target, exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
     return browser_download
 
@@ -380,6 +380,6 @@ def make_browser_download_url(session: BrowserSession) -> Callable:
         try:
             return session.submit(_do)
         except Exception as exc:
-            lg.error('browser_download_url failed', url=url, error=str(exc))
+            lg.error('browser_download_url failed', url=url, exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
     return browser_download_url

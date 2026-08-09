@@ -18,7 +18,7 @@ from browser_tools import (
     make_browser_download, make_browser_download_url,
 )
 from gmail_client import (
-    GmailClient, MailContext, DONE_LABEL, FAILED_LABEL, NOTIFY_TO,
+    GmailClient, MailContext, DONE_LABEL, FAILED_LABEL, NOTIFY_TO, GMAIL_DEEPLINK,
 )
 
 
@@ -127,20 +127,15 @@ def build_prompt(tasks_md: str, mail_ctx: MailContext, body: str) -> str:
     )
 
 
-def _format_failure_email(mail_ctx: MailContext, rule_name: str, step: str, exc: Exception) -> tuple[str, str]:
-    subject = f'[mailprocessor FAIL] {step} -- {rule_name or mail_ctx.sender_address}'
-    deeplink = f'https://mail.google.com/mail/u/0/#inbox/{mail_ctx.id}'
-    body = (
+def _format_failure_report(mail_ctx: MailContext, rule_name: str, step: str) -> str:
+    '''Janitor body: one aligned block so the alert mail is readable as-is.'''
+    return (
+        f'{step} failed voor regel {rule_name or "unmatched"}\n'
         f'Mail:    {mail_ctx.subject}\n'
         f'Van:     {mail_ctx.sender_address}\n'
-        f'Regel:   {rule_name or "unmatched"}\n'
-        f'Stap:    {step}\n'
-        f'Fout:    {type(exc).__name__}: {exc}\n\n'
         f'Actie:   verwijder failed-label en run kickstart\n'
-        f'Gmail:   {deeplink}\n\n'
-        f'-- mailprocessor\n'
+        f'Gmail:   {GMAIL_DEEPLINK}{mail_ctx.id}\n'
     )
-    return subject, body
 
 
 def _format_reply_body(rule_name: str, saved_paths: list[str], date_iso: str) -> str:
@@ -156,9 +151,8 @@ def _format_reply_body(rule_name: str, saved_paths: list[str], date_iso: str) ->
 def make_apply_rule(
     gmail: GmailClient,
     mail_ctx: MailContext,
-    notifier,
 ) -> Callable[[list, str, str], str]:
-    '''Build the apply_rule tool closed over gmail + mail_ctx + notifier.
+    '''Build the apply_rule tool closed over gmail + mail_ctx.
 
     The returned callable is what justai introspects — its name (apply_rule),
     docstring, and type hints become the tool schema. The list[dict] shape for
@@ -172,7 +166,7 @@ def make_apply_rule(
         attachments item-shape: {"filename": "<exact attachment filename>",
                                   "target_path": "<absolute path within ALLOWED_ROOTS>"}
 
-        On failure at any step: adds mailprocessor/failed label, sends notification email,
+        On failure at any step: adds mailprocessor/failed label, alerts Janitor,
         returns 'failed: <reason>'. On success: returns 'done: <rule_name>'.
         '''
         saved_paths: list[str] = []
@@ -206,11 +200,7 @@ def make_apply_rule(
             return f'done: {rule_name}'
 
         except Exception as exc:
-            lg.error(
-                f'apply_rule failed at {step}',
-                rule=rule_name, mail_id=mail_ctx.id, exc_info=True,
-            )
-            _fail(gmail, mail_ctx, notifier, rule_name, step, exc)
+            _fail(gmail, mail_ctx, rule_name, f'apply_rule/{step}', exc)
             return f'failed: {step}: {type(exc).__name__}: {exc}'
 
     return apply_rule
@@ -219,7 +209,6 @@ def make_apply_rule(
 def make_apply_downloaded(
     gmail: GmailClient,
     mail_ctx: MailContext,
-    notifier,
 ) -> Callable[[str, str, str, str], str]:
     '''apply_downloaded for browser-flow rules. Moves a local file (from
     browser_download) to its final ALLOWED_ROOTS path, then mirrors the
@@ -263,11 +252,7 @@ def make_apply_downloaded(
             return f'done: {rule_name}'
 
         except Exception as exc:
-            lg.error(
-                f'apply_downloaded failed at {step}',
-                rule=rule_name, mail_id=mail_ctx.id, exc_info=True,
-            )
-            _fail(gmail, mail_ctx, notifier, rule_name, step, exc)
+            _fail(gmail, mail_ctx, rule_name, f'apply_downloaded/{step}', exc)
             return f'failed: {step}: {type(exc).__name__}: {exc}'
 
     return apply_downloaded
@@ -378,28 +363,22 @@ def report_no_action(reason: str) -> str:
 def _fail(
     gmail: GmailClient,
     mail_ctx: MailContext,
-    notifier,
     rule_name: str,
     step: str,
     exc: Exception,
 ) -> None:
-    '''Label + notify on failure. Swallow secondary errors so the agent can return.'''
+    '''Label + alert Janitor. Swallow the labelling error so the agent can return.'''
     try:
         gmail.add_label(mail_ctx.id, FAILED_LABEL)
-    except Exception:
-        lg.error('failed to add failed-label', mail_id=mail_ctx.id)
-    try:
-        subject, body = _format_failure_email(mail_ctx, rule_name, step, exc)
-        notifier.email_error(subject, body)
-    except Exception:
-        lg.error('failed to send error notification', mail_id=mail_ctx.id)
+    except Exception as label_exc:
+        lg.error(f'failed to add failed-label op {mail_ctx.id}\n', exc_info=label_exc)
+    lg.error(_format_failure_report(mail_ctx, rule_name, step), exc_info=exc)
 
 
 async def process_mail(
     gmail: GmailClient,
     mail_ctx: MailContext,
     tasks_md: str,
-    notifier,
     *,
     model: str = 'claude-sonnet-4-6',
 ) -> str:
@@ -426,8 +405,8 @@ async def process_mail(
             tools=[
                 make_read_pdf_excerpt(gmail, mail_ctx),
                 read_pdf_file,
-                make_apply_rule(gmail, mail_ctx, notifier),
-                make_apply_downloaded(gmail, mail_ctx, notifier),
+                make_apply_rule(gmail, mail_ctx),
+                make_apply_downloaded(gmail, mail_ctx),
                 report_no_action,
                 make_browser_open(browser),
                 make_browser_snapshot(browser),

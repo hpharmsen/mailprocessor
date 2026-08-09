@@ -26,8 +26,11 @@ def mock_gmail():
 
 
 @pytest.fixture
-def mock_notifier():
-    return MagicMock()
+def mock_lg_error(monkeypatch):
+    '''Capture the lg.error calls that JanitorWebhookHandler ships to Janitor.'''
+    err = MagicMock()
+    monkeypatch.setattr(agent_runner.lg, 'error', err)
+    return err
 
 
 @pytest.fixture
@@ -36,7 +39,7 @@ def relax_allowed_roots(tmp_path, monkeypatch):
 
 
 def test_apply_rule_calls_steps_in_order(
-    mock_gmail, mock_notifier, relax_allowed_roots, tmp_path,
+    mock_gmail, relax_allowed_roots, tmp_path,
 ):
     ctx = _ctx(tmp_path)
     calls = []
@@ -53,7 +56,7 @@ def test_apply_rule_calls_steps_in_order(
     mock_gmail.download_attachment.side_effect = download_side
 
     target = tmp_path / 'out.pdf'
-    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx, mock_notifier)
+    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx)
     result = apply_rule(
         [{'filename': ctx.attachment_filenames[0], 'target_path': str(target)}],
         'body', 'leap',
@@ -65,30 +68,35 @@ def test_apply_rule_calls_steps_in_order(
     assert target.read_bytes() == b'PDF-BYTES'
 
 
-def test_apply_rule_failure_at_save_adds_failed_label_emails_and_returns_failed(
-    mock_gmail, mock_notifier, tmp_path, monkeypatch,
+def test_apply_rule_failure_at_save_adds_failed_label_alerts_and_returns_failed(
+    mock_gmail, mock_lg_error, tmp_path, monkeypatch,
 ):
     # ALLOWED_ROOTS unchanged — write to /tmp will trigger PathNotAllowedError
     ctx = _ctx(tmp_path)
-    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx, mock_notifier)
+    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx)
     result = apply_rule(
         [{'filename': ctx.attachment_filenames[0],
           'target_path': '/tmp/not-in-allowed-roots.pdf'}],
         'body', 'leap',
     )
     mock_gmail.add_label.assert_called_once_with(ctx.id, FAILED_LABEL)
-    mock_notifier.email_error.assert_called_once()
+    mock_lg_error.assert_called_once()
+    # exc_info is what gives Janitor a per-exception fingerprint; without it
+    # every error in the project collapses onto one issue.
+    message, kwargs = mock_lg_error.call_args[0][0], mock_lg_error.call_args[1]
+    assert ctx.subject in message and ctx.id in message
+    assert isinstance(kwargs['exc_info'], Exception)
     mock_gmail.send_reply.assert_not_called()
     mock_gmail.mark_read.assert_not_called()
     assert result.startswith('failed: save:')
 
 
 def test_apply_rule_failure_at_reply_does_not_mark_read(
-    mock_gmail, mock_notifier, relax_allowed_roots, tmp_path,
+    mock_gmail, mock_lg_error, relax_allowed_roots, tmp_path,
 ):
     ctx = _ctx(tmp_path)
     mock_gmail.send_reply.side_effect = RuntimeError('smtp down')
-    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx, mock_notifier)
+    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx)
     result = apply_rule(
         [{'filename': ctx.attachment_filenames[0],
           'target_path': str(tmp_path / 'x.pdf')}],
@@ -96,12 +104,12 @@ def test_apply_rule_failure_at_reply_does_not_mark_read(
     )
     mock_gmail.mark_read.assert_not_called()
     mock_gmail.add_label.assert_called_once_with(ctx.id, FAILED_LABEL)
-    mock_notifier.email_error.assert_called_once()
+    mock_lg_error.assert_called_once()
     assert result.startswith('failed: reply:')
 
 
 def test_apply_rule_multi_attachment_one_reply(
-    mock_gmail, mock_notifier, relax_allowed_roots, tmp_path,
+    mock_gmail, relax_allowed_roots, tmp_path,
 ):
     ctx = MailContext(
         id='m1', thread_id='t1', message_id_header='<x@y>',
@@ -109,7 +117,7 @@ def test_apply_rule_multi_attachment_one_reply(
         attachment_filenames=['a.pdf', 'b.pdf'],
         attachment_ids={'a.pdf': 'att-a', 'b.pdf': 'att-b'},
     )
-    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx, mock_notifier)
+    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx)
     result = apply_rule(
         [
             {'filename': 'a.pdf', 'target_path': str(tmp_path / 'a.pdf')},
@@ -123,10 +131,10 @@ def test_apply_rule_multi_attachment_one_reply(
 
 
 def test_apply_rule_unknown_attachment_filename_fails(
-    mock_gmail, mock_notifier, relax_allowed_roots, tmp_path,
+    mock_gmail, relax_allowed_roots, tmp_path,
 ):
     ctx = _ctx(tmp_path)
-    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx, mock_notifier)
+    apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx)
     result = apply_rule(
         [{'filename': 'unknown.pdf', 'target_path': str(tmp_path / 'unknown.pdf')}],
         'body', 'leap',
@@ -220,7 +228,7 @@ def test_read_pdf_excerpt_respects_max_chars(mock_gmail, tmp_path):
     assert len(result) <= 20
 
 
-def test_process_mail_cleans_tempfile_even_on_exception(monkeypatch, mock_gmail, mock_notifier, tmp_path):
+def test_process_mail_cleans_tempfile_even_on_exception(monkeypatch, mock_gmail, tmp_path):
     ctx = _ctx(tmp_path)
     created_paths = []
 
@@ -235,13 +243,13 @@ def test_process_mail_cleans_tempfile_even_on_exception(monkeypatch, mock_gmail,
 
     import asyncio
     with pytest.raises(RuntimeError):
-        asyncio.run(agent_runner.process_mail(mock_gmail, ctx, 'tasks', mock_notifier))
+        asyncio.run(agent_runner.process_mail(mock_gmail, ctx, 'tasks'))
 
     assert created_paths
     assert not Path(created_paths[0]).exists()
 
 
-def test_process_mail_passes_tools_and_returns_answer(monkeypatch, mock_gmail, mock_notifier, tmp_path):
+def test_process_mail_passes_tools_and_returns_answer(monkeypatch, mock_gmail, tmp_path):
     ctx = _ctx(tmp_path)
     captured = {}
 
@@ -258,7 +266,7 @@ def test_process_mail_passes_tools_and_returns_answer(monkeypatch, mock_gmail, m
     monkeypatch.setattr(agent_runner, 'Agent', _StubAgent)
 
     import asyncio
-    answer = asyncio.run(agent_runner.process_mail(mock_gmail, ctx, 'tasks', mock_notifier))
+    answer = asyncio.run(agent_runner.process_mail(mock_gmail, ctx, 'tasks'))
     assert answer == 'done: leap'
     names = [t.__name__ for t in captured['tools']]
     assert names == [

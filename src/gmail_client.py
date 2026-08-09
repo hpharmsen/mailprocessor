@@ -9,19 +9,51 @@ from email.utils import parseaddr
 from html.parser import HTMLParser
 from pathlib import Path
 
+import httplib2
 from google.auth.exceptions import TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from justlog import lg
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
 NOTIFY_TO = os.environ['NOTIFY_TO']
 DONE_LABEL = 'mailprocessor/done'
 FAILED_LABEL = 'mailprocessor/failed'
+GMAIL_DEEPLINK = 'https://mail.google.com/mail/u/0/#inbox/'
 REFRESH_ATTEMPTS = 2
 REFRESH_BACKOFF_SECONDS = 2.0
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 2.0
+TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_transient(exc: Exception) -> bool:
+    '''429/5xx en netwerkblips; al het andere is een echte bug.'''
+    if isinstance(exc, HttpError):
+        return exc.resp.status in TRANSIENT_STATUS
+    # httplib2 gooit OSError-subklassen (timeout, connection reset, SSLError) en
+    # zijn eigen HttpLib2Error, bv. ServerNotFoundError bij een DNS-hik. Binnen
+    # een .execute() is een OSError altijd netwerk.
+    return isinstance(exc, (OSError, httplib2.HttpLib2Error))
+
+
+def _execute(request, what: str):
+    '''Voer een Gmail-request uit en retry transient falen met backoff.
+
+    WARNING per retry, geen ERROR: de laatste poging propageert, zodat de
+    caller precies één ERROR (en dus één Janitor-alert) logt.
+    '''
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return request.execute()
+        except Exception as e:
+            if attempt == RETRY_ATTEMPTS or not _is_transient(e):
+                raise
+            lg.warning(f'{what} failed, retrying', attempt=attempt, error=str(e))
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
 
 class NoValidTokenError(Exception):
@@ -57,7 +89,8 @@ def load_credentials(token_path: Path, credentials_path: Path) -> Credentials:
                 break
             except TransportError as e:
                 if attempt == REFRESH_ATTEMPTS:
-                    lg.error('oauth token refresh failed after retries', error=str(e), attempts=attempt)
+                    lg.error('oauth token refresh failed after retries',
+                             attempts=attempt, exc_info=e)
                     raise
                 lg.warning('oauth token refresh failed, retrying', error=str(e), attempt=attempt)
                 time.sleep(REFRESH_BACKOFF_SECONDS)
@@ -181,14 +214,18 @@ class GmailClient:
             f'in:inbox from:({from_clause}) '
             f'-label:{DONE_LABEL} -label:{FAILED_LABEL}'
         )
-        res = self._svc.users().messages().list(userId='me', q=q).execute()
+        res = _execute(
+            self._svc.users().messages().list(userId='me', q=q), 'query_pending',
+        )
         return [m['id'] for m in res.get('messages', [])]
 
     def get_message(self, message_id: str) -> MailContext:
         '''Fetch full message and build MailContext. Raises InvalidSenderError on CRLF.'''
-        msg = self._svc.users().messages().get(
-            userId='me', id=message_id, format='full'
-        ).execute()
+        msg = _execute(
+            self._svc.users().messages().get(
+                userId='me', id=message_id, format='full'),
+            'get_message',
+        )
         payload = msg['payload']
         headers = payload.get('headers', [])
 
@@ -219,17 +256,21 @@ class GmailClient:
 
     def download_attachment(self, message_id: str, attachment_id: str) -> bytes:
         '''Fetch attachment bytes by id.'''
-        res = self._svc.users().messages().attachments().get(
-            userId='me', messageId=message_id, id=attachment_id
-        ).execute()
+        res = _execute(
+            self._svc.users().messages().attachments().get(
+                userId='me', messageId=message_id, id=attachment_id),
+            'download_attachment',
+        )
         return base64.urlsafe_b64decode(res['data'])
 
     def get_message_body(self, message_id: str) -> str:
         '''Return body as plain text. If no text/plain part exists, the text/html
         part is converted to text and a list of links is appended.'''
-        msg = self._svc.users().messages().get(
-            userId='me', id=message_id, format='full'
-        ).execute()
+        msg = _execute(
+            self._svc.users().messages().get(
+                userId='me', id=message_id, format='full'),
+            'get_message_body',
+        )
         plain_chunks: list[str] = []
         html_chunks: list[str] = []
         for part in _walk_parts(msg['payload']):
@@ -271,7 +312,10 @@ class GmailClient:
         q = f'from:{sender} subject:({subject_contains}) after:{after_epoch}'
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            res = self._svc.users().messages().list(userId='me', q=q).execute()
+            res = _execute(
+                self._svc.users().messages().list(userId='me', q=q),
+                'wait_for_email poll',
+            )
             msgs = res.get('messages', [])
             if msgs:
                 return self.get_message_body(msgs[0]['id'])
@@ -285,20 +329,23 @@ class GmailClient:
 
     def ensure_labels(self) -> None:
         '''Create mailprocessor/done + mailprocessor/failed if missing. Cache ids.'''
-        existing = self._svc.users().labels().list(userId='me').execute()
+        existing = _execute(self._svc.users().labels().list(userId='me'), 'labels list')
         by_name = {lab['name']: lab['id'] for lab in existing.get('labels', [])}
         for needed in (DONE_LABEL, FAILED_LABEL):
             if needed in by_name:
                 self._label_ids[needed] = by_name[needed]
             else:
-                created = self._svc.users().labels().create(
-                    userId='me',
-                    body={
-                        'name': needed,
-                        'labelListVisibility': 'labelShow',
-                        'messageListVisibility': 'show',
-                    },
-                ).execute()
+                created = _execute(
+                    self._svc.users().labels().create(
+                        userId='me',
+                        body={
+                            'name': needed,
+                            'labelListVisibility': 'labelShow',
+                            'messageListVisibility': 'show',
+                        },
+                    ),
+                    'labels create',
+                )
                 self._label_ids[needed] = created['id']
 
     def add_label(self, message_id: str, label_name: str) -> None:
@@ -307,16 +354,22 @@ class GmailClient:
         if not label_id:
             self.ensure_labels()
             label_id = self._label_ids[label_name]
-        self._svc.users().messages().modify(
-            userId='me', id=message_id,
-            body={'addLabelIds': [label_id]},
-        ).execute()
+        _execute(
+            self._svc.users().messages().modify(
+                userId='me', id=message_id,
+                body={'addLabelIds': [label_id]},
+            ),
+            'add_label',
+        )
 
     def mark_read(self, message_id: str) -> None:
-        self._svc.users().messages().modify(
-            userId='me', id=message_id,
-            body={'removeLabelIds': ['UNREAD']},
-        ).execute()
+        _execute(
+            self._svc.users().messages().modify(
+                userId='me', id=message_id,
+                body={'removeLabelIds': ['UNREAD']},
+            ),
+            'mark_read',
+        )
 
     # --- sending ---------------------------------------------------------
 
@@ -332,7 +385,13 @@ class GmailClient:
             msg['References'] = mail_ctx.message_id_header
         msg.set_content(body)
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        self._svc.users().messages().send(
-            userId='me',
-            body={'raw': raw, 'threadId': mail_ctx.thread_id},
-        ).execute()
+        # Niet idempotent: bij een timeout ná verzenden levert de retry een
+        # dubbele reply op. Bewuste keuze -- een dubbele notificatie aan
+        # NOTIFY_TO is goedkoper dan een mail die op failed blijft staan.
+        _execute(
+            self._svc.users().messages().send(
+                userId='me',
+                body={'raw': raw, 'threadId': mail_ctx.thread_id},
+            ),
+            'send_reply',
+        )

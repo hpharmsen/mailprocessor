@@ -6,11 +6,8 @@ Two modes:
 '''
 import asyncio
 import os
-import smtplib
 import sys
-from email.mime.text import MIMEText
 from pathlib import Path
-from types import SimpleNamespace
 
 from dotenv import load_dotenv
 
@@ -19,11 +16,12 @@ load_dotenv(ROOT / '.env')
 
 from google.auth.exceptions import RefreshError, TransportError  # noqa: E402
 from justlog import lg, setup_logging  # noqa: E402
+from justlog.handlers import JanitorWebhookHandler  # noqa: E402
 
 import agent_runner  # noqa: E402
 import task_parser  # noqa: E402
 from gmail_client import (  # noqa: E402
-    GmailClient, NoValidTokenError, load_credentials, run_oauth_flow, NOTIFY_TO,
+    GmailClient, NoValidTokenError, load_credentials, run_oauth_flow, GMAIL_DEEPLINK,
 )
 
 TOKEN_PATH = ROOT / 'token.json'
@@ -32,43 +30,32 @@ TASKS_MD_PATH = ROOT / 'tasks.md'
 LOG_PATH = Path('/Users/hp/Library/Logs/mailprocessor/app.log')
 
 
-def email_error(subject: str, body: str) -> None:
-    '''Send a notification via Gmail SMTP (independent of the Gmail API).'''
-    password = os.getenv('EMAIL_PASSWORD_HP')
-    if not password:
-        lg.error('EMAIL_PASSWORD_HP not set; cannot send notification', subject=subject)
-        return
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = NOTIFY_TO
-    msg['To'] = NOTIFY_TO
-    try:
-        with smtplib.SMTP('smtp.gmail.com', 587) as srv:
-            srv.starttls()
-            srv.login(NOTIFY_TO, password)
-            srv.send_message(msg)
-    except Exception as e:
-        lg.error('smtp send failed', error=str(e), subject=subject)
-
-
 async def run() -> int:
-    setup_logging(str(LOG_PATH), max_bytes=1_000_000, backup_count=5)
+    # capture: justai logs to its own logger, which propagates to root instead of
+    # to ours. Without it, an LLM failure never reaches the log file or Janitor.
+    setup_logging(
+        str(LOG_PATH), max_bytes=1_000_000, backup_count=5, capture=('justai',),
+    )
 
-    if os.getenv('JANITOR_ERRORS') == '1':
-        from justlog.handlers import JanitorWebhookHandler
-        lg.addHandler(JanitorWebhookHandler(project='mailprocessor'))
+    # Every lg.error below is an alert: JanitorWebhookHandler ships it to
+    # Janitor, which dedups on the exception fingerprint and mails the rest.
+    if not os.getenv('EMAILME_TOKEN'):
+        print('ERROR: EMAILME_TOKEN not set; errors will not reach Janitor.',
+              file=sys.stderr)
+    lg.addHandler(JanitorWebhookHandler(project='mailprocessor'))
 
     try:
         creds = load_credentials(TOKEN_PATH, CREDENTIALS_PATH)
-    except TransportError as e:
-        lg.error('oauth token refresh failed (transient network error)', error=str(e))
+    except TransportError:
+        # load_credentials already alerted Janitor after its final retry.
+        lg.warning('run aborted: oauth refresh unavailable')
         return 1
     except (NoValidTokenError, RefreshError) as e:
-        email_error(
-            'mailprocessor: OAuth needs re-bootstrap',
-            f'Run: cd {ROOT} && uv run src/main.py setup-auth\n\nDetail: {e}\n',
+        lg.error(
+            'oauth bootstrap required\n'
+            f'Actie: cd {ROOT} && uv run src/main.py setup-auth\n',
+            exc_info=e,
         )
-        lg.error('oauth bootstrap required', error=str(e))
         return 1
 
     gmail = GmailClient(creds)
@@ -83,8 +70,7 @@ async def run() -> int:
     try:
         mids = gmail.query_pending(senders)
     except Exception as e:
-        lg.error('gmail query failed', error=str(e), exc_info=True)
-        email_error('mailprocessor: gmail query failed', f'{type(e).__name__}: {e}\n')
+        lg.error('gmail query failed', exc_info=e)
         return 1
 
     if not mids:
@@ -93,17 +79,14 @@ async def run() -> int:
 
     lg.info('processing mails', count=len(mids), senders=len(senders))
 
-    notifier = SimpleNamespace(email_error=email_error)
     for mid in mids:
         try:
             mail_ctx = gmail.get_message(mid)
         except Exception as e:
-            lg.error('get_message failed', mail_id=mid, error=str(e), exc_info=True)
+            lg.error(f'get_message failed\nMail-id: {mid}\n', exc_info=e)
             continue
         try:
-            outcome = await agent_runner.process_mail(
-                gmail, mail_ctx, tasks_md, notifier,
-            )
+            outcome = await agent_runner.process_mail(gmail, mail_ctx, tasks_md)
             lg.info(
                 'processed',
                 sender=mail_ctx.sender_address,
@@ -112,12 +95,11 @@ async def run() -> int:
             )
         except Exception as e:
             lg.error(
-                'unhandled in process_mail',
-                mail_id=mid, error=str(e), exc_info=True,
-            )
-            email_error(
-                f'mailprocessor crash on {mail_ctx.subject}',
-                f'From: {mail_ctx.sender_address}\nError: {type(e).__name__}: {e}\n',
+                f'crash in process_mail\n'
+                f'Mail:    {mail_ctx.subject}\n'
+                f'Van:     {mail_ctx.sender_address}\n'
+                f'Gmail:   {GMAIL_DEEPLINK}{mail_ctx.id}\n',
+                exc_info=e,
             )
     return 0
 

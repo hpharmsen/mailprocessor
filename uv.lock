@@ -2,10 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.13"
 
-[options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
-exclude-newer-span = "P7D"
-
 [[package]]
 name = "absl-py"
 version = "2.4.0"
@@ -786,7 +782,7 @@ wheels = [
 
 [[package]]
 name = "justai"
-version = "5.6.3"
+version = "5.6.7"
 source = { editable = "/Users/hp/proj/justai" }
 dependencies = [
     { name = "absl-py" },
@@ -850,8 +846,8 @@ wheels = [
 
 [[package]]
 name = "justlog"
-version = "0.8.5"
-source = { git = "https://github.com/hpharmsen/justlog.git?rev=0.8.5#000fd850a7b08be216a45b5afb409a9ac3bdb3c5" }
+version = "0.8.9"
+source = { git = "https://github.com/hpharmsen/justlog.git?rev=0.8.9#8b0354dfa6fc384a147a5c89bdddc5d18cd62996" }
 
 [[package]]
 name = "lxml"
@@ -943,7 +939,7 @@ requires-dist = [
     { name = "google-auth-httplib2", specifier = ">=0.2.0" },
     { name = "google-auth-oauthlib", specifier = ">=1.2.0" },
     { name = "justai", editable = "/Users/hp/proj/justai" },
-    { name = "justlog", git = "https://github.com/hpharmsen/justlog.git?rev=0.8.5" },
+    { name = "justlog", git = "https://github.com/hpharmsen/justlog.git?rev=0.8.9" },
     { name = "playwright", specifier = ">=1.60.0" },
     { name = "pypdf", specifier = ">=4.0.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
