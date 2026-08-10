@@ -356,6 +356,10 @@ def make_browser_download(session: BrowserSession) -> Callable:
     return browser_download
 
 
+DOWNLOAD_RETRY_ATTEMPTS = 3
+DOWNLOAD_RETRY_BACKOFF_SECONDS = 2.0
+
+
 def make_browser_download_url(session: BrowserSession) -> Callable:
     def browser_download_url(url: str) -> str:
         '''Fetch `url` via the browser's HTTP context (cookies/session inherited
@@ -363,11 +367,30 @@ def make_browser_download_url(session: BrowserSession) -> Callable:
         Use this when a download URL is known directly — e.g. an href from
         a button — and clicking it triggers a navigation rather than a download
         event. Returns the absolute temp path.'''
+        def _fetch(page: Page):
+            '''Download and validate the body, retrying transient truncation.
+
+            WARNING per retry, geen ERROR: de laatste poging propageert, zodat
+            de caller precies één ERROR (en dus één Janitor-alert) logt.
+            '''
+            for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+                resp = page.context.request.get(url, timeout=60000)
+                if not resp.ok:
+                    raise RuntimeError(f'HTTP {resp.status}')
+                body = resp.body()
+                content_length = resp.headers.get('content-length')
+                expected = int(content_length) if content_length else None
+                if body and (expected is None or len(body) == expected):
+                    return body, resp
+                if attempt == DOWNLOAD_RETRY_ATTEMPTS:
+                    raise RuntimeError(
+                        f'truncated download: got {len(body)} bytes, expected {expected}')
+                lg.warning('browser_download_url truncated, retrying', url=url,
+                           attempt=attempt, got=len(body), expected=expected)
+                time.sleep(DOWNLOAD_RETRY_BACKOFF_SECONDS * attempt)
+
         def _do(page: Page) -> str:
-            resp = page.context.request.get(url, timeout=60000)
-            if not resp.ok:
-                return f'error: HTTP {resp.status}'
-            body = resp.body()
+            body, resp = _fetch(page)
             cd = resp.headers.get('content-disposition', '')
             m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
             filename = m.group(1) if m else 'download.bin'
