@@ -274,7 +274,8 @@ def test_process_mail_passes_tools_and_returns_answer(monkeypatch, mock_gmail, t
         'apply_rule', 'apply_downloaded', 'report_no_action',
         'browser_open', 'browser_snapshot', 'browser_click',
         'browser_fill', 'browser_fill_credential', 'browser_fill_otp',
-        'browser_download', 'browser_download_url', 'wait_for_email',
+        'browser_download', 'browser_download_url', 'browser_save_pdf',
+        'wait_for_email',
     ]
     assert agent_runner.report_no_action in captured['tools']
     assert agent_runner.read_pdf_file in captured['tools']

@@ -15,7 +15,7 @@ from browser_tools import (
     BrowserSession,
     make_browser_open, make_browser_snapshot, make_browser_click,
     make_browser_fill, make_browser_fill_credential, make_browser_fill_otp,
-    make_browser_download, make_browser_download_url,
+    make_browser_download, make_browser_download_url, make_browser_save_pdf,
 )
 from gmail_client import (
     GmailClient, MailContext, DONE_LABEL, FAILED_LABEL, NOTIFY_TO, GMAIL_DEEPLINK,
@@ -77,8 +77,15 @@ Beschikbare tools:
       behouden). Gebruik dit als `browser_download` faalt met een timeout omdat
       de link een navigatie/redirect naar een PDF-URL is i.p.v. een
       download-event. Lees de `href` uit de snapshot en geef die als `url`.
+14. browser_save_pdf() -> temp_path
+    - Sla de huidige pagina op als PDF. Gebruik dit voor een "view in browser"
+      pagina zonder downloadbare link/knop (bv. een online factuur/receipt):
+      open de pagina met `browser_open`, roep dan `browser_save_pdf` aan.
+      Geef het pad als `source_path` aan `apply_downloaded`. Gebruik dit NOOIT
+      i.c.m. `browser_download` — die verwacht een download-event, wat een
+      "view in browser"-link niet triggert.
 
-14. wait_for_email(sender, subject_contains, timeout_seconds) -> body
+15. wait_for_email(sender, subject_contains, timeout_seconds) -> body
     - Wacht (poll) op een NIEUWE mail van `sender` met `subject_contains` in
       het onderwerp. Retourneert de body. Gebruik dit voor 2FA-codes — extract
       de code zelf uit de body met regex/inspectie en geef die door aan
@@ -89,6 +96,8 @@ Workflow:
 - Voor attachment-regels: roep apply_rule aan met de juiste target_path.
 - Voor browser-regels (Odido): doorloop browser_open -> fill creds -> click ->
   wait_for_email -> fill code -> click -> browser_download -> apply_downloaded.
+- Voor "view in browser"-regels (Grok): browser_open (de link-URL uit de mail) ->
+  browser_save_pdf -> apply_downloaded.
 - Vul placeholders. Volgorde van voorkeur:
     a. Uit attachment-naam of download-filename.
     b. Uit PDF-content via read_pdf_excerpt of read_pdf_file.
@@ -416,6 +425,7 @@ async def process_mail(
                 make_browser_fill_otp(browser),
                 make_browser_download(browser),
                 make_browser_download_url(browser),
+                make_browser_save_pdf(browser),
                 make_wait_for_email(gmail, after_epoch),
             ],
             max_iterations=25,

@@ -356,6 +356,27 @@ def make_browser_download(session: BrowserSession) -> Callable:
     return browser_download
 
 
+def make_browser_save_pdf(session: BrowserSession) -> Callable:
+    def browser_save_pdf() -> str:
+        '''Save the current page as a PDF (via Chromium's headless print-to-PDF).
+        Use this for pages that must be archived as-is instead of downloaded —
+        e.g. a "view in browser" invoice/receipt page with no download link.
+        Returns the absolute temp path to the saved PDF.'''
+        def _do(page: Page) -> str:
+            _settle(page)
+            tmp_dir = Path(tempfile.mkdtemp(prefix='mailprocessor-pdf-'))
+            tmp_path = tmp_dir / 'page.pdf'
+            page.pdf(path=str(tmp_path))
+            lg.info('browser save pdf', url=page.url, path=str(tmp_path))
+            return str(tmp_path)
+        try:
+            return session.submit(_do)
+        except Exception as exc:
+            lg.error('browser_save_pdf failed', exc_info=exc)
+            return f'error: {type(exc).__name__}: {exc}'
+    return browser_save_pdf
+
+
 DOWNLOAD_RETRY_ATTEMPTS = 3
 DOWNLOAD_RETRY_BACKOFF_SECONDS = 2.0
 
