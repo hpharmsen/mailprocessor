@@ -1,29 +1,31 @@
-'''Headless browser tools for the agent (Playwright-driven).
+"""Headless browser tools for the agent (Playwright-driven).
 
 justai dispatches tools synchronously, so we use playwright.sync_api. sync_api
 cannot run inside an asyncio event loop, so a BrowserSession owns a dedicated
 worker thread that holds the Playwright context and serves callables submitted
 via a queue. Each tool blocks on the worker until the operation returns.
-'''
+"""
+
 import os
 import queue
 import re
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from justlog import lg
-from playwright.sync_api import sync_playwright, Page
-
+from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 SNAPSHOT_TRUNCATE = 6000
 SCREENSHOT_DIR = Path(tempfile.gettempdir()) / 'mailprocessor-shots'
 
 
 def _save_screenshot_sync(page: Page, label: str) -> str | None:
-    '''Save a screenshot for debugging. Returns the path or None.'''
+    """Save a screenshot for debugging. Returns the path or None."""
     try:
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         path = SCREENSHOT_DIR / f'{label}-{os.getpid()}-{int(time.time() * 1000)}.png'
@@ -34,7 +36,7 @@ def _save_screenshot_sync(page: Page, label: str) -> str | None:
 
 
 class BrowserSession:
-    '''Single-page Playwright session running on its own thread.'''
+    """Single-page Playwright session running on its own thread."""
 
     _SENTINEL = object()
 
@@ -65,9 +67,7 @@ class BrowserSession:
                 timezone_id='Europe/Amsterdam',
             )
             # Hide the navigator.webdriver flag that headless Chromium sets.
-            ctx.add_init_script(
-                'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
-            )
+            ctx.add_init_script('Object.defineProperty(navigator, "webdriver", {get: () => undefined});')
             page = ctx.new_page()
             try:
                 while True:
@@ -92,13 +92,15 @@ class BrowserSession:
             if self._started:
                 return
             self._thread = threading.Thread(
-                target=self._worker, name='browser-session', daemon=True,
+                target=self._worker,
+                name='browser-session',
+                daemon=True,
             )
             self._thread.start()
             self._started = True
 
     def submit(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
-        '''Run `fn(page, *args, **kwargs)` on the worker. Blocks for result.'''
+        """Run `fn(page, *args, **kwargs)` on the worker. Blocks for result."""
         if not self._started:
             self._start()
         fut: dict = {'done': threading.Event()}
@@ -119,6 +121,7 @@ class BrowserSession:
 
 
 # ----- page helpers (run on the worker thread, take `page` as first arg) -----
+
 
 def _settle(page: Page) -> None:
     try:
@@ -188,42 +191,49 @@ def _resolve_input(page: Page, target: str):
 
 def make_browser_open(session: BrowserSession) -> Callable:
     def browser_open(url: str) -> str:
-        '''Open `url` in the headless browser. Returns an accessibility snapshot
+        """Open `url` in the headless browser. Returns an accessibility snapshot
         of the loaded page (truncated). Use this once per flow, then continue
-        with browser_click / browser_fill / browser_snapshot.'''
+        with browser_click / browser_fill / browser_snapshot."""
+
         def _do(page: Page) -> str:
             page.goto(url, timeout=30000, wait_until='domcontentloaded')
             _settle(page)
             lg.info('browser open', url=url, title=page.title())
             return _snapshot_text(page)
+
         try:
             return session.submit(_do)
         except Exception as exc:
             shot = session.submit(_save_screenshot_sync, 'open-fail') if session._started else None
             lg.error('browser_open failed', url=url, exc_info=exc, screenshot=shot)
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_open
 
 
 def make_browser_snapshot(session: BrowserSession) -> Callable:
     def browser_snapshot() -> str:
-        '''Return the current page's accessibility tree as text. Use this when
-        you need to see what's on the page after a click or navigation.'''
+        """Return the current page's accessibility tree as text. Use this when
+        you need to see what's on the page after a click or navigation."""
+
         def _do(page: Page) -> str:
             _settle(page)
             return _snapshot_text(page)
+
         try:
             return session.submit(_do)
         except Exception as exc:
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_snapshot
 
 
 def make_browser_click(session: BrowserSession) -> Callable:
     def browser_click(target: str) -> str:
-        '''Click a button or link whose visible label/role-name matches `target`.
+        """Click a button or link whose visible label/role-name matches `target`.
         Use the exact visible text where possible (e.g. "Inloggen", "Accepteren").
-        Returns a fresh accessibility snapshot of the page after the click.'''
+        Returns a fresh accessibility snapshot of the page after the click."""
+
         def _do(page: Page) -> dict:
             loc = _resolve_clickable(page, target)
             if loc is None:
@@ -234,6 +244,7 @@ def make_browser_click(session: BrowserSession) -> Callable:
             _settle(page)
             lg.info('browser click', target=target, url=page.url)
             return {'snapshot': _snapshot_text(page)}
+
         try:
             r = session.submit(_do)
             return r.get('snapshot') or f'error: {r.get("error")}'
@@ -241,14 +252,16 @@ def make_browser_click(session: BrowserSession) -> Callable:
             shot = session.submit(_save_screenshot_sync, f'click-fail-{target[:30]}')
             lg.error('browser_click failed', target=target, exc_info=exc, screenshot=shot)
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_click
 
 
 def make_browser_fill(session: BrowserSession) -> Callable:
     def browser_fill(target: str, value: str) -> str:
-        '''Fill an input identified by `target` (label, placeholder, or name) with
+        """Fill an input identified by `target` (label, placeholder, or name) with
         `value`. Use this for non-secret values like a 6-digit verification code.
-        For passwords, use browser_fill_credential.'''
+        For passwords, use browser_fill_credential."""
+
         def _do(page: Page) -> str:
             loc = _resolve_input(page, target)
             if loc is None:
@@ -257,44 +270,49 @@ def make_browser_fill(session: BrowserSession) -> Callable:
             loc.fill(value, timeout=10000)
             lg.info('browser fill', target=target, chars=len(value))
             return f'filled: {target}'
+
         try:
             return session.submit(_do)
         except Exception as exc:
             lg.error('browser_fill failed', target=target, exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_fill
 
 
 def make_browser_fill_credential(session: BrowserSession) -> Callable:
     def browser_fill_credential(target: str, env_var_name: str) -> str:
-        '''Fill an input identified by `target` with the value of environment
+        """Fill an input identified by `target` with the value of environment
         variable `env_var_name`. The secret value never travels through the LLM:
-        only the env var NAME is passed in.'''
+        only the env var NAME is passed in."""
         value = os.getenv(env_var_name)
         if not value:
             return f'error: env var {env_var_name} not set'
+
         def _do(page: Page) -> str:
             loc = _resolve_input(page, target)
             if loc is None:
-                lg.warning('browser_fill_credential no match',
-                           target=target, env_var=env_var_name)
+                lg.warning('browser_fill_credential no match', target=target, env_var=env_var_name)
                 return f'error: no input matched "{target}"'
             loc.fill(value, timeout=10000)
             lg.info('browser fill credential', target=target, env_var=env_var_name)
             return f'filled: {target} (from {env_var_name})'
+
         try:
             return session.submit(_do)
         except Exception as exc:
             lg.error('browser_fill_credential failed', target=target, exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_fill_credential
 
 
 def make_browser_fill_otp(session: BrowserSession) -> Callable:
     def browser_fill_otp(code: str) -> str:
-        '''Fill an OTP / verification-code field that splits the digits across
+        """Fill an OTP / verification-code field that splits the digits across
         N separate `<input>` boxes (each maxlength=1). Pass the full code as a
-        single string. Returns the count of inputs filled.'''
+        single string. Returns the count of inputs filled."""
+
         def _do(page: Page) -> str:
             digits = ''.join(ch for ch in code if ch.isdigit())
             if not digits:
@@ -311,57 +329,68 @@ def make_browser_fill_otp(session: BrowserSession) -> Callable:
                 if count >= len(digits):
                     for i, d in enumerate(digits):
                         loc.nth(i).fill(d, timeout=5000)
-                    lg.info('browser fill otp', digits=len(digits),
-                            inputs=count, selector=sel)
+                    lg.info('browser fill otp', digits=len(digits), inputs=count, selector=sel)
                     return f'filled {len(digits)} digits across {count} inputs'
                 if count > 0:
                     return (
-                        f'error: only {count} OTP inputs found for selector "{sel}" '
-                        f'but code has {len(digits)} digits'
+                        f'error: only {count} OTP inputs found for selector "{sel}" but code has {len(digits)} digits'
                     )
             return 'error: no OTP inputs found on page'
+
         try:
             return session.submit(_do)
         except Exception as exc:
             lg.error('browser_fill_otp failed', exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_fill_otp
 
 
 def make_browser_download(session: BrowserSession) -> Callable:
     def browser_download(target: str) -> str:
-        '''Click `target` and wait for the resulting download. Saves to a temp
+        """Click `target` and wait for the resulting download. Saves to a temp
         path and returns its absolute path (string). Pass this path to
         apply_downloaded as `source_path`. If clicking triggers a navigation
         to a download URL instead of a download event, use browser_download_url
-        with the href instead.'''
+        with the href instead."""
+
         def _do(page: Page) -> str:
             loc = _resolve_clickable(page, target)
             if loc is None:
                 return f'error: no clickable element matched "{target}"'
-            with page.expect_download(timeout=60000) as dl_info:
-                loc.click(timeout=10000)
-            download = dl_info.value
+            for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+                try:
+                    with page.expect_download(timeout=60000) as dl_info:
+                        loc.click(timeout=10000)
+                    download = dl_info.value
+                    break
+                except PlaywrightTimeoutError:
+                    if attempt == DOWNLOAD_RETRY_ATTEMPTS:
+                        raise
+                    lg.warning('browser_download timed out, retrying', target=target, attempt=attempt)
+                    time.sleep(DOWNLOAD_RETRY_BACKOFF_SECONDS * attempt)
             tmp_dir = Path(tempfile.mkdtemp(prefix='mailprocessor-dl-'))
             tmp_path = tmp_dir / (download.suggested_filename or 'download.bin')
             download.save_as(str(tmp_path))
-            lg.info('browser download', target=target, path=str(tmp_path),
-                    filename=download.suggested_filename)
+            lg.info('browser download', target=target, path=str(tmp_path), filename=download.suggested_filename)
             return str(tmp_path)
+
         try:
             return session.submit(_do)
         except Exception as exc:
             lg.error('browser_download failed', target=target, exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_download
 
 
 def make_browser_save_pdf(session: BrowserSession) -> Callable:
     def browser_save_pdf() -> str:
-        '''Save the current page as a PDF (via Chromium's headless print-to-PDF).
+        """Save the current page as a PDF (via Chromium's headless print-to-PDF).
         Use this for pages that must be archived as-is instead of downloaded —
         e.g. a "view in browser" invoice/receipt page with no download link.
-        Returns the absolute temp path to the saved PDF.'''
+        Returns the absolute temp path to the saved PDF."""
+
         def _do(page: Page) -> str:
             _settle(page)
             tmp_dir = Path(tempfile.mkdtemp(prefix='mailprocessor-pdf-'))
@@ -369,11 +398,13 @@ def make_browser_save_pdf(session: BrowserSession) -> Callable:
             page.pdf(path=str(tmp_path))
             lg.info('browser save pdf', url=page.url, path=str(tmp_path))
             return str(tmp_path)
+
         try:
             return session.submit(_do)
         except Exception as exc:
             lg.error('browser_save_pdf failed', exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_save_pdf
 
 
@@ -383,17 +414,18 @@ DOWNLOAD_RETRY_BACKOFF_SECONDS = 2.0
 
 def make_browser_download_url(session: BrowserSession) -> Callable:
     def browser_download_url(url: str) -> str:
-        '''Fetch `url` via the browser's HTTP context (cookies/session inherited
+        """Fetch `url` via the browser's HTTP context (cookies/session inherited
         from the current page) and save the response body to a temp path.
         Use this when a download URL is known directly — e.g. an href from
         a button — and clicking it triggers a navigation rather than a download
-        event. Returns the absolute temp path.'''
+        event. Returns the absolute temp path."""
+
         def _fetch(page: Page):
-            '''Download and validate the body, retrying transient truncation.
+            """Download and validate the body, retrying transient truncation.
 
             WARNING per retry, geen ERROR: de laatste poging propageert, zodat
             de caller precies één ERROR (en dus één Janitor-alert) logt.
-            '''
+            """
             for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
                 resp = page.context.request.get(url, timeout=60000)
                 if not resp.ok:
@@ -404,26 +436,31 @@ def make_browser_download_url(session: BrowserSession) -> Callable:
                 if body and (expected is None or len(body) == expected):
                     return body, resp
                 if attempt == DOWNLOAD_RETRY_ATTEMPTS:
-                    raise RuntimeError(
-                        f'truncated download: got {len(body)} bytes, expected {expected}')
-                lg.warning('browser_download_url truncated, retrying', url=url,
-                           attempt=attempt, got=len(body), expected=expected)
+                    raise RuntimeError(f'truncated download: got {len(body)} bytes, expected {expected}')
+                lg.warning(
+                    'browser_download_url truncated, retrying',
+                    url=url,
+                    attempt=attempt,
+                    got=len(body),
+                    expected=expected,
+                )
                 time.sleep(DOWNLOAD_RETRY_BACKOFF_SECONDS * attempt)
 
         def _do(page: Page) -> str:
             body, resp = _fetch(page)
             cd = resp.headers.get('content-disposition', '')
-            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
+            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.IGNORECASE)
             filename = m.group(1) if m else 'download.bin'
             tmp_dir = Path(tempfile.mkdtemp(prefix='mailprocessor-dl-'))
             tmp_path = tmp_dir / filename
             tmp_path.write_bytes(body)
-            lg.info('browser download url', url=url, path=str(tmp_path),
-                    bytes=len(body))
+            lg.info('browser download url', url=url, path=str(tmp_path), bytes=len(body))
             return str(tmp_path)
+
         try:
             return session.submit(_do)
         except Exception as exc:
             lg.error('browser_download_url failed', url=url, exc_info=exc)
             return f'error: {type(exc).__name__}: {exc}'
+
     return browser_download_url
