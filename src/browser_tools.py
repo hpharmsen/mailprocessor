@@ -144,6 +144,21 @@ def _snapshot_text(page: Page) -> str:
     return f'URL: {page.url}\n\n{snap}'
 
 
+def _dismiss_cookie_banner(page: Page) -> bool:
+    """Best-effort: click away a cookie-consent overlay that intercepts pointer
+    events on the real target. Returns True if something was dismissed."""
+    for text in ('Accepteren', 'Alles accepteren', 'Akkoord', 'Accept all', 'Accept', 'Weigeren', 'Reject'):
+        try:
+            loc = page.get_by_role('button', name=text, exact=False).first
+            if loc.count() and loc.is_visible():
+                loc.click(timeout=2000)
+                lg.info('dismissed cookie banner', text=text)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _resolve_clickable(page: Page, target: str):
     # Escape quotes in target for has-text expression
     escaped = target.replace('"', '\\"')
@@ -240,7 +255,12 @@ def make_browser_click(session: BrowserSession) -> Callable:
                 shot = _save_screenshot_sync(page, f'click-nomatch-{target[:30]}')
                 lg.warning('browser_click no match', target=target, screenshot=shot)
                 return {'error': f'no clickable element matched "{target}"'}
-            loc.click(timeout=10000)
+            try:
+                loc.click(timeout=10000)
+            except PlaywrightTimeoutError:
+                if not _dismiss_cookie_banner(page):
+                    raise
+                loc.click(timeout=10000)
             _settle(page)
             lg.info('browser click', target=target, url=page.url)
             return {'snapshot': _snapshot_text(page)}
