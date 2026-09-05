@@ -1,28 +1,42 @@
-'''Per-mail justai agent: chooses one of two tools, performs the action.'''
+"""Per-mail justai agent: chooses one of two tools, performs the action."""
+
+import asyncio
 import io
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Callable
 
 from justai import Agent
+from justai.models.basemodel import ConnectionException
 from justlog import lg
 from pypdf import PdfReader
 
 import disk
 from browser_tools import (
     BrowserSession,
-    make_browser_open, make_browser_snapshot, make_browser_click,
-    make_browser_fill, make_browser_fill_credential, make_browser_fill_otp,
-    make_browser_download, make_browser_download_url, make_browser_save_pdf,
+    make_browser_click,
+    make_browser_download,
+    make_browser_download_url,
+    make_browser_fill,
+    make_browser_fill_credential,
+    make_browser_fill_otp,
+    make_browser_open,
+    make_browser_save_pdf,
+    make_browser_snapshot,
 )
 from gmail_client import (
-    GmailClient, MailContext, DONE_LABEL, FAILED_LABEL, NOTIFY_TO, GMAIL_DEEPLINK,
+    DONE_LABEL,
+    FAILED_LABEL,
+    GMAIL_DEEPLINK,
+    GmailClient,
+    MailContext,
 )
 
+AGENT_RETRY_ATTEMPTS = 3
+AGENT_RETRY_BACKOFF_SECONDS = 2.0
 
-PROMPT_TEMPLATE = '''Je bent een mail-rule-matcher. Hieronder staan de verwerkings-
+PROMPT_TEMPLATE = """Je bent een mail-rule-matcher. Hieronder staan de verwerkings-
 regels (tasks.md) en daaronder de mail om te verwerken.
 
 Beschikbare tools:
@@ -117,7 +131,7 @@ attachments: {attachments}
 
 === body (truncated) ===
 {body}
-'''
+"""
 
 BODY_PROMPT_LIMIT = 4000
 
@@ -137,7 +151,7 @@ def build_prompt(tasks_md: str, mail_ctx: MailContext, body: str) -> str:
 
 
 def _format_failure_report(mail_ctx: MailContext, rule_name: str, step: str) -> str:
-    '''Janitor body: one aligned block so the alert mail is readable as-is.'''
+    """Janitor body: one aligned block so the alert mail is readable as-is."""
     return (
         f'{step} failed voor regel {rule_name or "unmatched"}\n'
         f'Mail:    {mail_ctx.subject}\n'
@@ -161,15 +175,16 @@ def make_apply_rule(
     gmail: GmailClient,
     mail_ctx: MailContext,
 ) -> Callable[[list, str, str], str]:
-    '''Build the apply_rule tool closed over gmail + mail_ctx.
+    """Build the apply_rule tool closed over gmail + mail_ctx.
 
     The returned callable is what justai introspects — its name (apply_rule),
     docstring, and type hints become the tool schema. The list[dict] shape for
     `attachments` is described in the prompt because justai's schema-builder
     cannot infer item shape from a generic list annotation.
-    '''
+    """
+
     def apply_rule(attachments: list, reply_body: str, rule_name: str) -> str:
-        '''Save each attachment to its target_path, send one reply to hp@harmsen.nl,
+        """Save each attachment to its target_path, send one reply to hp@harmsen.nl,
         mark the mail as read, add the mailprocessor/done label.
 
         attachments item-shape: {"filename": "<exact attachment filename>",
@@ -177,7 +192,7 @@ def make_apply_rule(
 
         On failure at any step: adds mailprocessor/failed label, alerts Janitor,
         returns 'failed: <reason>'. On success: returns 'done: <rule_name>'.
-        '''
+        """
         saved_paths: list[str] = []
         step = 'save'
         try:
@@ -190,12 +205,19 @@ def make_apply_rule(
                 data = gmail.download_attachment(mail_ctx.id, att_id)
                 status = disk.save_attachment_bytes(target, data)
                 saved_paths.append(str(target.resolve()))
-                lg.info('attachment saved', filename=filename,
-                        target=str(target.resolve()), status=status, rule=rule_name)
+                lg.info(
+                    'attachment saved', filename=filename, target=str(target.resolve()), status=status, rule=rule_name
+                )
 
             step = 'reply'
-            full_reply = reply_body.rstrip() + '\n\n' + _format_reply_body(
-                rule_name, saved_paths, mail_ctx.date_iso,
+            full_reply = (
+                reply_body.rstrip()
+                + '\n\n'
+                + _format_reply_body(
+                    rule_name,
+                    saved_paths,
+                    mail_ctx.date_iso,
+                )
             )
             gmail.send_reply(mail_ctx, full_reply)
 
@@ -219,11 +241,15 @@ def make_apply_downloaded(
     gmail: GmailClient,
     mail_ctx: MailContext,
 ) -> Callable[[str, str, str, str], str]:
-    '''apply_downloaded for browser-flow rules. Moves a local file (from
+    """apply_downloaded for browser-flow rules. Moves a local file (from
     browser_download) to its final ALLOWED_ROOTS path, then mirrors the
-    apply_rule side-effects: reply to NOTIFY_TO, mark read, add done-label.'''
+    apply_rule side-effects: reply to NOTIFY_TO, mark read, add done-label."""
+
     def apply_downloaded(
-        source_path: str, target_path: str, reply_body: str, rule_name: str,
+        source_path: str,
+        target_path: str,
+        reply_body: str,
+        rule_name: str,
     ) -> str:
         step = 'read_source'
         try:
@@ -236,12 +262,17 @@ def make_apply_downloaded(
             target = Path(target_path)
             status = disk.save_attachment_bytes(target, data)
             saved_paths = [str(target.resolve())]
-            lg.info('downloaded saved', filename=src.name,
-                    target=str(target.resolve()), status=status, rule=rule_name)
+            lg.info('downloaded saved', filename=src.name, target=str(target.resolve()), status=status, rule=rule_name)
 
             step = 'reply'
-            full_reply = reply_body.rstrip() + '\n\n' + _format_reply_body(
-                rule_name, saved_paths, mail_ctx.date_iso,
+            full_reply = (
+                reply_body.rstrip()
+                + '\n\n'
+                + _format_reply_body(
+                    rule_name,
+                    saved_paths,
+                    mail_ctx.date_iso,
+                )
             )
             gmail.send_reply(mail_ctx, full_reply)
 
@@ -268,12 +299,15 @@ def make_apply_downloaded(
 
 
 def make_wait_for_email(gmail: GmailClient, after_epoch: int) -> Callable:
-    '''Bind wait_for_email to a starting timestamp so old mails are ignored.'''
+    """Bind wait_for_email to a starting timestamp so old mails are ignored."""
+
     def wait_for_email(
-        sender: str, subject_contains: str, timeout_seconds: int = 120,
+        sender: str,
+        subject_contains: str,
+        timeout_seconds: int = 120,
     ) -> str:
-        '''Poll Gmail until a new mail from `sender` with `subject_contains` in
-        the subject arrives. Returns the body text. Raises after timeout.'''
+        """Poll Gmail until a new mail from `sender` with `subject_contains` in
+        the subject arrives. Returns the body text. Raises after timeout."""
         try:
             body = gmail.wait_for_email(
                 sender=sender,
@@ -281,22 +315,21 @@ def make_wait_for_email(gmail: GmailClient, after_epoch: int) -> Callable:
                 timeout_seconds=timeout_seconds,
                 after_epoch=after_epoch,
             )
-            lg.info('wait_for_email hit', sender=sender,
-                    subject_contains=subject_contains, body_chars=len(body))
+            lg.info('wait_for_email hit', sender=sender, subject_contains=subject_contains, body_chars=len(body))
             return body
         except TimeoutError as exc:
-            lg.warning('wait_for_email timeout', sender=sender,
-                       subject_contains=subject_contains)
+            lg.warning('wait_for_email timeout', sender=sender, subject_contains=subject_contains)
             return f'timeout: {exc}'
         except Exception as exc:
             lg.error('wait_for_email failed', error=str(exc), exc_info=True)
             return f'error: {type(exc).__name__}: {exc}'
+
     return wait_for_email
 
 
 def read_pdf_file(path: str, max_chars: int = 2000) -> str:
-    '''Read text from a PDF at an absolute local path. Returns the first
-    max_chars characters of concatenated page text.'''
+    """Read text from a PDF at an absolute local path. Returns the first
+    max_chars characters of concatenated page text."""
     try:
         p = Path(path)
         if not p.is_absolute() or not p.exists():
@@ -312,8 +345,7 @@ def read_pdf_file(path: str, max_chars: int = 2000) -> str:
                 break
         full = '\n'.join(chunks)
         excerpt = full[:max_chars]
-        lg.info('pdf file excerpt read', path=path,
-                chars=len(excerpt), pages=len(reader.pages))
+        lg.info('pdf file excerpt read', path=path, chars=len(excerpt), pages=len(reader.pages))
         return excerpt or '(no extractable text)'
     except Exception as exc:
         lg.error('pdf file read failed', path=path, exc_info=True)
@@ -324,15 +356,16 @@ def make_read_pdf_excerpt(
     gmail: GmailClient,
     mail_ctx: MailContext,
 ) -> Callable[[str, int], str]:
-    '''Build the read_pdf_excerpt tool closed over gmail + mail_ctx.
+    """Build the read_pdf_excerpt tool closed over gmail + mail_ctx.
 
     The tool downloads the named attachment, extracts text via pypdf,
     and returns the first max_chars characters joined across all pages.
-    '''
+    """
+
     def read_pdf_excerpt(filename: str, max_chars: int = 2000) -> str:
-        '''Read text from a PDF attachment of this mail. Returns the first
+        """Read text from a PDF attachment of this mail. Returns the first
         max_chars characters of concatenated page text. Use this to find
-        an invoice date or service period that is not in the filename.'''
+        an invoice date or service period that is not in the filename."""
         att_id = mail_ctx.attachment_ids.get(filename)
         if not att_id:
             available = list(mail_ctx.attachment_ids)
@@ -350,8 +383,7 @@ def make_read_pdf_excerpt(
                     break
             full = '\n'.join(chunks)
             excerpt = full[:max_chars]
-            lg.info('pdf excerpt read', filename=filename,
-                    chars=len(excerpt), pages=len(reader.pages))
+            lg.info('pdf excerpt read', filename=filename, chars=len(excerpt), pages=len(reader.pages))
             return excerpt or '(no extractable text)'
         except Exception as exc:
             lg.error('pdf read failed', filename=filename, exc_info=True)
@@ -361,10 +393,10 @@ def make_read_pdf_excerpt(
 
 
 def report_no_action(reason: str) -> str:
-    '''Geen actie voor deze mail (geen regel match, of placeholder onvulbaar).
+    """Geen actie voor deze mail (geen regel match, of placeholder onvulbaar).
     Geen labels, mail blijft ongelezen, gelogd voor review.
     Returnt 'no-action: <reason>'.
-    '''
+    """
     lg.info('no action', reason=reason)
     return f'no-action: {reason}'
 
@@ -376,7 +408,7 @@ def _fail(
     step: str,
     exc: Exception,
 ) -> None:
-    '''Label + alert Janitor. Swallow the labelling error so the agent can return.'''
+    """Label + alert Janitor. Swallow the labelling error so the agent can return."""
     try:
         gmail.add_label(mail_ctx.id, FAILED_LABEL)
     except Exception as label_exc:
@@ -391,9 +423,10 @@ async def process_mail(
     *,
     model: str = 'claude-sonnet-4-6',
 ) -> str:
-    '''Run the justai agent for one mail; returns the agent's answer.'''
+    """Run the justai agent for one mail; returns the agent's answer."""
     fd, prompt_path_str = tempfile.mkstemp(suffix='.md')
     import os as _os
+
     _os.close(fd)
     prompt_path = Path(prompt_path_str)
     browser = BrowserSession()
@@ -431,7 +464,19 @@ async def process_mail(
             max_iterations=25,
             verbose=False,
         )
-        result = await agent.run_until_done(str(prompt_path))
+        for attempt in range(1, AGENT_RETRY_ATTEMPTS + 1):
+            try:
+                result = await agent.run_until_done(str(prompt_path))
+                break
+            except ConnectionException:
+                if attempt == AGENT_RETRY_ATTEMPTS:
+                    raise
+                lg.warning(
+                    'agent.run_until_done connection error, retrying',
+                    mail_id=mail_ctx.id,
+                    attempt=attempt,
+                )
+                await asyncio.sleep(AGENT_RETRY_BACKOFF_SECONDS * attempt)
         return result.answer
     finally:
         prompt_path.unlink(missing_ok=True)
