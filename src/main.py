@@ -21,7 +21,8 @@ from justlog.handlers import JanitorWebhookHandler  # noqa: E402
 import agent_runner  # noqa: E402
 import task_parser  # noqa: E402
 from gmail_client import (  # noqa: E402
-    GmailClient, NoValidTokenError, load_credentials, run_oauth_flow, GMAIL_DEEPLINK,
+    GmailClient, InvalidSenderError, NoValidTokenError, load_credentials,
+    run_oauth_flow, GMAIL_DEEPLINK,
 )
 
 TOKEN_PATH = ROOT / 'token.json'
@@ -82,6 +83,11 @@ async def run() -> int:
     for mid in mids:
         try:
             mail_ctx = gmail.get_message(mid)
+        except InvalidSenderError as e:
+            # Verwachte client-side uitkomst, geen bug: een malformed From-header
+            # komt van de afzender. WARNING, dus geen Janitor-alert.
+            lg.warning('skipping mail with malformed sender', mail_id=mid, sender=str(e))
+            continue
         except Exception as e:
             lg.error(f'get_message failed\nMail-id: {mid}\n', exc_info=e)
             continue
