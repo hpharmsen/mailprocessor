@@ -782,7 +782,7 @@ wheels = [
 
 [[package]]
 name = "justai"
-version = "5.6.7"
+version = "5.6.9"
 source = { editable = "/Users/hp/proj/justai" }
 dependencies = [
     { name = "absl-py" },
@@ -846,8 +846,8 @@ wheels = [
 
 [[package]]
 name = "justlog"
-version = "0.8.9"
-source = { git = "https://github.com/hpharmsen/justlog.git?rev=0.8.9#8b0354dfa6fc384a147a5c89bdddc5d18cd62996" }
+version = "0.9.0"
+source = { git = "https://github.com/hpharmsen/justlog.git?rev=0.9.0#e49918ee0660a98f85e88d65e3f17a5bc644e482" }
 
 [[package]]
 name = "lxml"
@@ -939,7 +939,7 @@ requires-dist = [
     { name = "google-auth-httplib2", specifier = ">=0.2.0" },
     { name = "google-auth-oauthlib", specifier = ">=1.2.0" },
     { name = "justai", editable = "/Users/hp/proj/justai" },
-    { name = "justlog", git = "https://github.com/hpharmsen/justlog.git?rev=0.8.9" },
+    { name = "justlog", git = "https://github.com/hpharmsen/justlog.git?rev=0.9.0" },
     { name = "playwright", specifier = ">=1.60.0" },
     { name = "pypdf", specifier = ">=4.0.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
