@@ -421,7 +421,7 @@ async def process_mail(
     mail_ctx: MailContext,
     tasks_md: str,
     *,
-    model: str = 'claude-sonnet-4-6',
+    model: str = 'gpt-6-luna',
 ) -> str:
     """Run the justai agent for one mail; returns the agent's answer."""
     fd, prompt_path_str = tempfile.mkstemp(suffix='.md')

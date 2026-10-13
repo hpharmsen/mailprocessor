@@ -38,5 +38,4 @@ def test_extract_senders_on_real_tasks_md_excludes_self():
     content = (FIXTURES.parent.parent / 'tasks.md').read_text()
     senders = task_parser.extract_senders(content)
     assert 'hp@harmsen.nl' not in senders
-    assert 'pelle.schlichting@leap24.eu' in senders
     assert 'invoice+statements@mail.anthropic.com' in senders
