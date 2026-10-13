@@ -14,37 +14,48 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / '.env')
 
-from google.auth.exceptions import RefreshError, TransportError  # noqa: E402
 from justlog import lg, setup_logging  # noqa: E402
 from justlog.handlers import JanitorWebhookHandler  # noqa: E402
-
-import agent_runner  # noqa: E402
-import task_parser  # noqa: E402
-from gmail_client import (  # noqa: E402
-    GmailClient, InvalidSenderError, NoValidTokenError, load_credentials,
-    run_oauth_flow, GMAIL_DEEPLINK,
-)
 
 TOKEN_PATH = ROOT / 'token.json'
 CREDENTIALS_PATH = ROOT / 'credentials.json'
 TASKS_MD_PATH = ROOT / 'tasks.md'
 LOG_PATH = Path('/Users/hp/Library/Logs/mailprocessor/app.log')
 
+# Logging staat vóór de projectimports: een kapotte dependency (bv. justai
+# als editable path-dep die een nieuwe package nodig heeft) crasht anders al
+# bij het importeren, buiten het logbestand en Janitor om.
+# capture: justai logs to its own logger, which propagates to root instead of
+# to ours. Without it, an LLM failure never reaches the log file or Janitor.
+setup_logging(
+    str(LOG_PATH), max_bytes=1_000_000, backup_count=5, capture=('justai',),
+)
+# Every lg.error below is an alert: JanitorWebhookHandler ships it to
+# Janitor, which dedups on the exception fingerprint and mails the rest.
+if not os.getenv('EMAILME_TOKEN'):
+    print('ERROR: EMAILME_TOKEN not set; errors will not reach Janitor.',
+          file=sys.stderr)
+lg.addHandler(JanitorWebhookHandler(project='mailprocessor'))
+
+try:
+    from google.auth.exceptions import RefreshError, TransportError
+
+    import agent_runner
+    import task_parser
+    from gmail_client import (
+        GmailClient, InvalidSenderError, NoValidTokenError, load_credentials,
+        run_oauth_flow, GMAIL_DEEPLINK,
+    )
+except Exception as e:
+    lg.error(
+        'import failed; venv out of sync?\n'
+        f'Actie: cd {ROOT} && uv sync\n',
+        exc_info=e,
+    )
+    sys.exit(1)
+
 
 async def run() -> int:
-    # capture: justai logs to its own logger, which propagates to root instead of
-    # to ours. Without it, an LLM failure never reaches the log file or Janitor.
-    setup_logging(
-        str(LOG_PATH), max_bytes=1_000_000, backup_count=5, capture=('justai',),
-    )
-
-    # Every lg.error below is an alert: JanitorWebhookHandler ships it to
-    # Janitor, which dedups on the exception fingerprint and mails the rest.
-    if not os.getenv('EMAILME_TOKEN'):
-        print('ERROR: EMAILME_TOKEN not set; errors will not reach Janitor.',
-              file=sys.stderr)
-    lg.addHandler(JanitorWebhookHandler(project='mailprocessor'))
-
     try:
         creds = load_credentials(TOKEN_PATH, CREDENTIALS_PATH)
     except TransportError:
