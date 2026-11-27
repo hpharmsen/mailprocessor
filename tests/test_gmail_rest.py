@@ -3,6 +3,7 @@ import io
 import json
 import urllib.error
 
+import gmail_mcp
 import gmail_rest
 import pytest
 from gmail_rest import REST_URL, GmailRest
@@ -21,7 +22,7 @@ class Creds:
 @pytest.fixture
 def http(monkeypatch):
     """Scripted urlopen: each entry is a dict (JSON response) or an exception."""
-    monkeypatch.setattr(gmail_rest.time, 'sleep', lambda s: None)
+    monkeypatch.setattr(gmail_mcp.time, 'sleep', lambda s: None)
     state = {'responses': [], 'requests': []}
 
     def urlopen(req, timeout):
@@ -68,8 +69,8 @@ def test_expired_token_is_refreshed_before_call(http):
 
 def test_server_error_is_retried_with_warning(http, monkeypatch):
     logged = []
-    monkeypatch.setattr(gmail_rest.lg, 'warning', lambda *a, **k: logged.append('W'))
-    monkeypatch.setattr(gmail_rest.lg, 'error', lambda *a, **k: logged.append('E'))
+    monkeypatch.setattr(gmail_mcp.lg, 'warning', lambda *a, **k: logged.append('W'))
+    monkeypatch.setattr(gmail_mcp.lg, 'error', lambda *a, **k: logged.append('E'))
     http['responses'] = [http_error(503), urllib.error.URLError('reset'), {'payload': {}}]
     assert GmailRest(Creds()).message_id('m1') is None
     assert logged == ['W', 'W']

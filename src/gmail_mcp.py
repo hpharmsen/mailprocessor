@@ -1,15 +1,14 @@
 """Gmail access via Google's Gmail MCP server, with a synchronous facade.
 
 All Gmail traffic goes through gmailmcp.googleapis.com (Workspace AI Tools
-Addendum). Messages are fetched once in RAW format and parsed locally, so
-headers, body and attachment bytes come from one call and never pass the LLM.
+Addendum), with one exception: the server has no attachment download and
+refuses RAW for mails with attachments, so attachment bytes and the Message-ID
+header come from gmail_rest, outside the agent. Bytes never pass the LLM.
 """
 
 import asyncio
-import base64
 import concurrent.futures
 import contextlib
-import email
 import json
 import os
 import queue
@@ -19,11 +18,9 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from email import policy
-from email.message import EmailMessage
-from email.utils import parseaddr
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx2
 from google.auth.exceptions import TransportError
@@ -34,6 +31,9 @@ from justlog import lg
 from mcp import Client, MCPError
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
+
+if TYPE_CHECKING:
+    from gmail_rest import GmailRest
 
 MCP_URL = 'https://gmailmcp.googleapis.com/mcp/v1self'
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
@@ -71,7 +71,7 @@ class MailContext:
     subject: str
     date_iso: str
     attachment_filenames: list[str]
-    attachment_ids: dict[str, str]  # filename -> Gmail partId
+    attachment_ids: dict[str, str]  # filename -> Gmail attachment id
 
 
 def load_credentials(token_path: Path) -> Credentials:
@@ -114,73 +114,47 @@ def _is_transient(exc: Exception) -> bool:
     return isinstance(exc, (OSError, httpx2.TransportError))
 
 
-# --- MIME parsing --------------------------------------------------------------
+def retry[T](name: str, fn: Callable[[], T], transient: Callable[[Exception], bool]) -> T:
+    """Run fn; retry transient failures with a WARNING each and re-raise the last one."""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == RETRY_ATTEMPTS or not transient(e):
+                raise
+            lg.warning(f'{name} failed, retrying', attempt=attempt, error=str(e))
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise AssertionError('unreachable')
 
 
-def _parse_raw(raw: str) -> EmailMessage:
-    """RAW is base64url MIME; plain MIME text is accepted too (it always has a ':' in its headers)."""
-    data = raw.encode() if ':' in raw[:1000] else base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4))
-    return email.message_from_bytes(data, policy=policy.default)
+# --- message fields ------------------------------------------------------------
 
 
-def _leaf_parts(msg: EmailMessage) -> Iterator[tuple[str, EmailMessage]]:
-    """Yield (partId, part) for every non-multipart part, numbered like Gmail: 0, 1, 1.0, ..."""
-
-    def walk(part, pid):
-        if part.is_multipart():
-            for i, sub in enumerate(part.iter_parts()):
-                yield from walk(sub, f'{pid}.{i}' if pid else str(i))
-        else:
-            yield pid, part
-
-    return walk(msg, '')
+def _validate_address(addr: str) -> str:
+    """The bare sender address; raise InvalidSenderError on CR/LF, spaces or a missing '@'."""
+    if not re.fullmatch(r'[^@\s<>]+@[^@\s<>]+', addr):
+        raise InvalidSenderError(addr)
+    return addr
 
 
-def _attachments(msg: EmailMessage) -> dict[str, str]:
-    return {part.get_filename(): pid for pid, part in _leaf_parts(msg) if part.get_filename()}
+def _message_id(value: str | None) -> str | None:
+    """The Message-ID if it is a single well-formed <...> token; it goes into outgoing headers."""
+    value = (value or '').strip()
+    return value if re.fullmatch(r'<[^<>\s]+>', value) else None
 
 
-def _text(part: EmailMessage) -> str:
-    try:
-        return part.get_content()
-    except (LookupError, ValueError):  # unknown charset or broken encoding
-        return (part.get_payload(decode=True) or b'').decode('utf-8', errors='replace')
+def _one_line(value: str | None) -> str:
+    return ' '.join((value or '').split())
 
 
-def body_text(msg: EmailMessage) -> str:
-    """Body as plain text; without a text/plain part the HTML is converted and its links appended."""
-    texts = [
-        (p.get_content_type(), _text(p))
-        for _, p in _leaf_parts(msg)
-        if not p.get_filename() and p.get_content_type() in ('text/plain', 'text/html')
-    ]
-    plain = [t for kind, t in texts if kind == 'text/plain']
-    if plain:
-        return '\n'.join(plain)
-    html = '\n'.join(t for kind, t in texts if kind == 'text/html')
-    if not html:
-        return ''
-    text, links = html_to_text_and_links(html)
+def _links(html: str) -> str:
+    """'=== Links ===' block with the deduplicated http(s) links of an HTML body, or ''."""
     first_label: dict[str, str] = {}
-    for label, href in links:
+    for label, href in html_to_text_and_links(html)[1]:
         if href.startswith(('http://', 'https://')):
             first_label.setdefault(href, label)
     lines = [f'- {label or "(no text)"}: {href}' for href, label in first_label.items()]
-    return f'{text}\n\n=== Links ===\n' + '\n'.join(lines) if lines else text
-
-
-def _validate_address(raw: str) -> tuple[str, str]:
-    """Return (name, addr); raise InvalidSenderError on CRLF or a missing address."""
-    name, addr = parseaddr(raw)
-    if any(c in raw for c in '\r\n') or not addr or '@' not in addr:
-        raise InvalidSenderError(raw)
-    return name, addr
-
-
-def _message_id(msg: EmailMessage) -> str | None:
-    """The Message-ID if it is a single well-formed <...> token; it goes into outgoing headers."""
-    value = str(msg.get('Message-ID') or '').strip()
-    return value if re.fullmatch(r'<[^<>\s]+>', value) else None
+    return '\n\n=== Links ===\n' + '\n'.join(lines) if lines else ''
 
 
 class _HTMLToText(HTMLParser):
@@ -234,7 +208,7 @@ def _server_connector(token: str) -> Callable[[], contextlib.AbstractAsyncContex
     @contextlib.asynccontextmanager
     async def connect():
         http = create_mcp_http_client(headers={'Authorization': f'Bearer {token}'})
-        # max_sse_event_size=None: a RAW message with a PDF easily exceeds the 1 MB default.
+        # max_sse_event_size=None: a FULL_CONTENT message with a big HTML body can exceed the 1 MB default.
         transport = streamable_http_client(MCP_URL, http_client=http, max_sse_event_size=None)
         async with http, Client(transport) as client:
             yield client
@@ -253,13 +227,15 @@ class GmailMcp:
         self,
         creds: Credentials | None = None,
         connect: Callable[[], contextlib.AbstractAsyncContextManager] | None = None,
+        rest: 'GmailRest | None' = None,
     ):
-        assert creds or connect
+        assert (creds or connect) and rest
         self._connect = connect or _server_connector(creds.token)
+        self._rest = rest
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._label_ids: dict[str, str] = {}
-        self._messages: dict[str, tuple[dict, EmailMessage]] = {}
+        self._messages: dict[str, dict] = {}
 
     # --- session plumbing ----------------------------------------------------
 
@@ -305,14 +281,7 @@ class GmailMcp:
 
     def call(self, name: str, args: dict) -> dict:
         """Call an MCP tool; retry transient failures with a WARNING each, re-raise the last one."""
-        for attempt in range(1, RETRY_ATTEMPTS + 1):
-            try:
-                return self._call_once(name, args)
-            except Exception as e:
-                if attempt == RETRY_ATTEMPTS or not _is_transient(e):
-                    raise
-                lg.warning(f'mcp {name} failed, retrying', attempt=attempt, error=str(e))
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+        return retry(f'mcp {name}', lambda: self._call_once(name, args), _is_transient)
 
     def _search(self, query: str) -> Iterator[dict]:
         """Yield every message of every matching thread (search_threads returns at most 5 per thread)."""
@@ -328,10 +297,10 @@ class GmailMcp:
                 return
             args = {**args, 'pageToken': res['nextPageToken']}
 
-    def _message(self, message_id: str) -> tuple[dict, EmailMessage]:
+    def _message(self, message_id: str) -> dict:
         if message_id not in self._messages:
-            res = self.call('get_message', {'messageId': message_id, 'messageFormat': 'RAW'})
-            self._messages[message_id] = res, _parse_raw(res['raw'])
+            args = {'messageId': message_id, 'messageFormat': 'FULL_CONTENT'}
+            self._messages[message_id] = self.call('get_message', args)
         return self._messages[message_id]
 
     # --- queries ---------------------------------------------------------------
@@ -356,35 +325,30 @@ class GmailMcp:
         ]
 
     def get_message(self, message_id: str) -> MailContext:
-        """Fetch the RAW message and build a MailContext. Raises InvalidSenderError on CRLF."""
-        res, msg = self._message(message_id)
-        try:
-            raw_from = str(msg.get('From') or '')
-        except ValueError as e:  # the stdlib refuses CR/LF in address parts
-            raise InvalidSenderError(str(e)) from e
-        name, addr = _validate_address(raw_from)
-        attachments = _attachments(msg)
+        """Build a MailContext. Raises InvalidSenderError on a malformed sender."""
+        res = self._message(message_id)
+        addr = _validate_address(res.get('sender', ''))
+        names = [d.get('displayName') for d in res.get('addressDisplayNames', []) if d.get('emailAddress') == addr]
+        attachments = {a['filename']: a['id'] for a in res.get('attachments', []) if a.get('filename')}
         return MailContext(
             id=message_id,
             thread_id=res.get('threadId', ''),
-            message_id_header=_message_id(msg),
+            message_id_header=_message_id(self._rest.message_id(message_id)),
             sender_address=addr,
-            sender_name=name,
-            subject=' '.join(str(msg.get('Subject') or '').split()),
-            date_iso=str(msg.get('Date') or ''),
+            sender_name=_one_line(names[0] if names else ''),
+            subject=_one_line(res.get('subject')),
+            date_iso=res.get('date', ''),
             attachment_filenames=list(attachments),
             attachment_ids=attachments,
         )
 
     def get_message_body(self, message_id: str) -> str:
-        return body_text(self._message(message_id)[1])
+        """Plain-text body (Gmail converts HTML-only mail), plus the links of the HTML body."""
+        res = self._message(message_id)
+        return res.get('plaintextBody', '') + _links(res.get('htmlBody', ''))
 
-    def download_attachment(self, message_id: str, part_id: str) -> bytes:
-        """Decoded bytes of the MIME part with this Gmail partId. Raises KeyError if absent."""
-        for pid, part in _leaf_parts(self._message(message_id)[1]):
-            if pid == part_id:
-                return part.get_payload(decode=True) or b''
-        raise KeyError(f'part {part_id} not in message {message_id}')
+    def download_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        return self._rest.attachment(message_id, attachment_id)
 
     def wait_for_email(
         self,

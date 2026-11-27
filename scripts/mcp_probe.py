@@ -2,16 +2,13 @@
 
 uv run scripts/mcp_probe.py tools
 uv run scripts/mcp_probe.py call <tool> '<json arguments>'
-uv run scripts/mcp_probe.py raw <message_id>      # attachments from RAW MIME
+uv run scripts/mcp_probe.py attachments <message_id>  # size + sha256 via gmail_rest
 """
 
 import asyncio
-import base64
-import email
 import hashlib
 import json
 import sys
-from email import policy
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -51,39 +48,23 @@ def payload(result) -> object:
         return texts
 
 
-def attachments_from_raw(raw: str) -> list[dict]:
-    """Walk the MIME tree with Gmail partId numbering and describe each attachment."""
-    try:
-        data = base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4))
-        if b'\n' not in data[:2000]:
-            raise ValueError
-    except ValueError:
-        data = raw.encode()
-    msg = email.message_from_bytes(data, policy=policy.default)
-    out = [{'raw_bytes': len(data), 'message_id': msg['Message-ID']}]
+def attachments(message_id: str, meta: dict) -> list[dict]:
+    """Download each attachment the way mailprocessor does (gmail_rest) and describe it."""
+    sys.path.insert(0, str(ROOT / 'src'))
+    from gmail_mcp import load_credentials
+    from gmail_rest import GmailRest
 
-    def walk(part, pid):
-        if part.is_multipart():
-            for i, sub in enumerate(part.iter_parts()):
-                walk(sub, f'{pid}.{i}' if pid else str(i))
-        elif part.get_filename():
-            body = part.get_payload(decode=True) or b''
-            out.append(
-                {
-                    'partId': pid,
-                    'filename': part.get_filename(),
-                    'bytes': len(body),
-                    'sha256': hashlib.sha256(body).hexdigest(),
-                }
-            )
-
-    walk(msg, '')
+    rest = GmailRest(load_credentials(ROOT / 'token.json'))
+    out = [{'message_id': rest.message_id(message_id)}]
+    for a in meta.get('attachments', []):
+        data = rest.attachment(message_id, a['id'])
+        out.append({'filename': a['filename'], 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
     return out
 
 
 async def main(argv: list[str]) -> None:
     http = create_mcp_http_client(headers={'Authorization': f'Bearer {token()}'})
-    async with http, Client(streamable_http_client(URL, http_client=http)) as client:
+    async with http, Client(streamable_http_client(URL, http_client=http, max_sse_event_size=None)) as client:
         cmd = argv[0] if argv else 'tools'
         if cmd == 'tools':
             tools = (await client.list_tools()).tools
@@ -91,9 +72,9 @@ async def main(argv: list[str]) -> None:
         elif cmd == 'call':
             res = await client.call_tool(argv[1], json.loads(argv[2]) if len(argv) > 2 else {})
             out = {'is_error': res.is_error, 'payload': payload(res)}
-        elif cmd == 'raw':
-            res = await client.call_tool('get_message', {'messageId': argv[1], 'messageFormat': 'RAW'})
-            out = attachments_from_raw(payload(res)['raw'])
+        elif cmd == 'attachments':
+            res = await client.call_tool('get_message', {'messageId': argv[1], 'messageFormat': 'PLAIN_TEXT'})
+            out = attachments(argv[1], payload(res))
         else:
             sys.exit(__doc__)
     print(json.dumps(out, indent=2, ensure_ascii=False))
