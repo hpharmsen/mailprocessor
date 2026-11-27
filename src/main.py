@@ -17,8 +17,12 @@ load_dotenv(ROOT / '.env')
 from justlog import lg, setup_logging  # noqa: E402
 from justlog.handlers import JanitorWebhookHandler  # noqa: E402
 
-TOKEN_PATH = ROOT / 'token.json'
-CREDENTIALS_PATH = ROOT / 'credentials.json'
+# OAuth client with the "AI-powered agent" flag; the Gmail MCP server rejects others.
+TOKEN_PATH = ROOT / 'token_mcp.json'
+CREDENTIALS_PATH = ROOT / 'credentials_mcp.json'
+# Plain OAuth client for gmail_rest (attachment bytes + Message-ID only).
+REST_TOKEN_PATH = ROOT / 'token.json'
+REST_CREDENTIALS_PATH = ROOT / 'credentials.json'
 TASKS_MD_PATH = ROOT / 'tasks.md'
 LOG_PATH = Path('/Users/hp/Library/Logs/mailprocessor/app.log')
 
@@ -41,11 +45,10 @@ try:
     from google.auth.exceptions import RefreshError, TransportError
 
     import agent_runner
+    import gmail_mcp
     import task_parser
-    from gmail_client import (
-        GmailClient, InvalidSenderError, NoValidTokenError, load_credentials,
-        run_oauth_flow, GMAIL_DEEPLINK,
-    )
+    from gmail_mcp import GMAIL_DEEPLINK, GmailMcp, InvalidSenderError
+    from gmail_rest import GmailRest
 except Exception as e:
     lg.error(
         'import failed; venv out of sync?\n'
@@ -57,12 +60,13 @@ except Exception as e:
 
 async def run() -> int:
     try:
-        creds = load_credentials(TOKEN_PATH, CREDENTIALS_PATH)
+        creds = gmail_mcp.load_credentials(TOKEN_PATH)
+        rest_creds = gmail_mcp.load_credentials(REST_TOKEN_PATH)
     except TransportError:
         # load_credentials already alerted Janitor after its final retry.
         lg.warning('run aborted: oauth refresh unavailable')
         return 1
-    except (NoValidTokenError, RefreshError) as e:
+    except (gmail_mcp.NoValidTokenError, RefreshError) as e:
         lg.error(
             'oauth bootstrap required\n'
             f'Actie: cd {ROOT} && uv run src/main.py setup-auth\n',
@@ -70,19 +74,30 @@ async def run() -> int:
         )
         return 1
 
-    gmail = GmailClient(creds)
-    gmail.ensure_labels()
-
     tasks_md = TASKS_MD_PATH.read_text()
     senders = task_parser.extract_senders(tasks_md)
     if not senders:
         lg.warning('no senders in tasks.md; nothing to do')
         return 0
 
+    gmail = GmailMcp(creds, rest=GmailRest(rest_creds))
     try:
+        return await _process_pending(gmail, senders, tasks_md)
+    finally:
+        gmail.close()
+
+
+async def _process_pending(gmail: GmailMcp, senders: set[str], tasks_md: str) -> int:
+    try:
+        gmail.ensure_labels()
         mids = gmail.query_pending(senders)
     except Exception as e:
-        lg.error('gmail query failed', exc_info=e)
+        # The first MCP call also opens the session, so a rejected token lands here.
+        lg.error(
+            'gmail mcp query failed\n'
+            f'Actie bij invalid_token: cd {ROOT} && uv run src/main.py setup-auth\n',
+            exc_info=e,
+        )
         return 1
 
     if not mids:
@@ -122,13 +137,19 @@ async def run() -> int:
 
 
 def setup_auth() -> int:
-    if not CREDENTIALS_PATH.exists():
-        print(f'ERROR: {CREDENTIALS_PATH} missing.')
-        print('Download the OAuth Desktop client from Google Cloud Console first.')
-        return 1
-    print('Opening browser for OAuth consent...')
-    run_oauth_flow(CREDENTIALS_PATH, TOKEN_PATH)
-    print(f'Token written to {TOKEN_PATH} (chmod 600).')
+    """OAuth for both clients: the agent client (MCP) and the plain client (gmail_rest)."""
+    for credentials, token, kind in (
+        (CREDENTIALS_PATH, TOKEN_PATH, 'with "Use this client for an AI-powered agent"'),
+        (REST_CREDENTIALS_PATH, REST_TOKEN_PATH, 'without the agent flag'),
+    ):
+        if not credentials.exists():
+            print(f'ERROR: {credentials} missing.')
+            print(f'Create a Desktop OAuth client {kind} in Google Cloud Console and save its JSON')
+            print('there (docs/solutions/integrations/gmail-mcp-setup.md).')
+            return 1
+        print(f'Opening browser for OAuth consent ({credentials.name})...')
+        gmail_mcp.run_oauth_flow(credentials, token)
+        print(f'Token written to {token} (chmod 600).')
     return 0
 
 

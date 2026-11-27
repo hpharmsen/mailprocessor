@@ -1,9 +1,13 @@
-"""Per-mail justai agent: chooses one of two tools, performs the action."""
+"""Per-mail justai agent: picks a rule from tasks.md and runs its tools."""
 
 import asyncio
+import html
 import io
+import json
+import os
 import tempfile
 import time
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
@@ -25,16 +29,20 @@ from browser_tools import (
     make_browser_save_pdf,
     make_browser_snapshot,
 )
-from gmail_client import (
+from gmail_mcp import (
     DONE_LABEL,
     FAILED_LABEL,
     GMAIL_DEEPLINK,
-    GmailClient,
+    SKIPPED_LABEL,
+    GmailMcp,
     MailContext,
 )
 
 AGENT_RETRY_ATTEMPTS = 3
 AGENT_RETRY_BACKOFF_SECONDS = 2.0
+# Always the www host: harmsen.nl answers 301 and the redirect turns the POST into an empty GET.
+EMAILME_URL = 'https://www.harmsen.nl/emailme/'
+EMAILME_TIMEOUT_SECONDS = 15
 
 PROMPT_TEMPLATE = """Je bent een mail-rule-matcher. Hieronder staan de verwerkings-
 regels (tasks.md) en daaronder de mail om te verwerken.
@@ -58,11 +66,17 @@ Beschikbare tools:
 
 4. apply_downloaded(source_path, target_path, reply_body, rule_name) -> str
    - Voor BROWSER-DOWNLOAD flows. Verplaatst het bestand op `source_path`
-     (uit browser_download) naar `target_path`, stuurt de reply, mark-read, done-label.
+     (uit browser_download) naar `target_path`, stuurt de bevestiging, mark-read, done-label.
    - target_path moet binnen ALLOWED_ROOTS vallen.
 
 5. report_no_action(reason: str) -> str
-   - Voor: geen regel match, of een fout waardoor geen actie mogelijk is.
+   - ALLEEN als geen enkele regel uit tasks.md bij deze mail past. De mail krijgt
+     het label mailprocessor/skipped en wordt niet opnieuw aangeboden.
+
+5b. report_failure(reason: str) -> str
+   - Als een regel WEL past maar de uitvoering mislukt (knop niet gevonden,
+     timeout, placeholder niet te bepalen, download mislukt). De mail krijgt
+     mailprocessor/failed en HP krijgt een melding.
 
 6. browser_open(url) -> snapshot
    - Open een URL in een headless browser. Retourneert de accessibility-tree
@@ -116,8 +130,8 @@ Workflow:
     a. Uit attachment-naam of download-filename.
     b. Uit PDF-content via read_pdf_excerpt of read_pdf_file.
     c. NIET uit ontvangstdatum van de mail -- die kan jaren afwijken bij backlog.
-- Als iets misgaat (geen knop gevonden, timeout, etc.) roep dan report_no_action
-  met een duidelijke uitleg.
+- Als iets misgaat (geen knop gevonden, timeout, etc.) roep dan report_failure
+  met een duidelijke uitleg. Gebruik report_no_action alleen als geen regel past.
 - Sluit af met een korte final_answer.
 
 === tasks.md ===
@@ -161,18 +175,56 @@ def _format_failure_report(mail_ctx: MailContext, rule_name: str, step: str) -> 
     )
 
 
-def _format_reply_body(rule_name: str, saved_paths: list[str], date_iso: str) -> str:
+def _format_reply_body(rule_name: str, saved_paths: list[str], mail_ctx: MailContext) -> str:
     paths_block = '\n'.join(f'  - {p}' for p in saved_paths)
     return (
         f'Verwerkt door regel: {rule_name}\n'
         f'Bestand(en) opgeslagen:\n{paths_block}\n'
-        f'Tijdstip: {date_iso}\n\n'
+        f'Tijdstip: {mail_ctx.date_iso}\n'
+        f'Gmail: {GMAIL_DEEPLINK}{mail_ctx.id}\n\n'
         f'-- mailprocessor\n'
     )
 
 
+def send_confirmation(mail_ctx: MailContext, body: str) -> None:
+    """Mail HP via emailme as a reply in the invoice's Gmail thread (In-Reply-To/References).
+
+    The Gmail MCP self-mode endpoint has no send tool, so emailme carries the confirmation.
+    """
+    subject = mail_ctx.subject or '(no subject)'
+    payload = {
+        'subject': subject if subject.lower().startswith('re:') else f'Re: {subject}',
+        'body': f'<pre>{html.escape(body)}</pre>',  # emailme renders the body as HTML
+        'sender_email': 'mailprocessor@harmsen.nl',
+    }
+    if mail_ctx.message_id_header:
+        payload['headers'] = {'In-Reply-To': mail_ctx.message_id_header, 'References': mail_ctx.message_id_header}
+    req = urllib.request.Request(
+        EMAILME_URL,
+        data=json.dumps(payload).encode(),
+        headers={
+            'Content-Type': 'application/json',
+            'X-Emailme-Token': os.environ.get('EMAILME_TOKEN', ''),
+            'User-Agent': 'mailprocessor/1.0',  # Cloudflare blocks the default Python-urllib agent (403, error 1010)
+        },
+        method='POST',
+    )
+    urllib.request.urlopen(req, timeout=EMAILME_TIMEOUT_SECONDS)
+
+
+def _finish(gmail: GmailMcp, mail_ctx: MailContext, rule_name: str, reply_body: str,
+            saved_paths: list[str], steps: list[str]) -> None:
+    """Confirm, mark read, add done-label; appends each step name first so a failure can name it."""
+    steps.append('confirm')
+    send_confirmation(mail_ctx, reply_body.rstrip() + '\n\n' + _format_reply_body(rule_name, saved_paths, mail_ctx))
+    steps.append('mark_read')
+    gmail.mark_read(mail_ctx.id)
+    steps.append('add_done')
+    gmail.add_label(mail_ctx.id, DONE_LABEL)
+
+
 def make_apply_rule(
-    gmail: GmailClient,
+    gmail: GmailMcp,
     mail_ctx: MailContext,
 ) -> Callable[[list, str, str], str]:
     """Build the apply_rule tool closed over gmail + mail_ctx.
@@ -184,7 +236,7 @@ def make_apply_rule(
     """
 
     def apply_rule(attachments: list, reply_body: str, rule_name: str) -> str:
-        """Save each attachment to its target_path, send one reply to hp@harmsen.nl,
+        """Save each attachment to its target_path, send one confirmation to HP,
         mark the mail as read, add the mailprocessor/done label.
 
         attachments item-shape: {"filename": "<exact attachment filename>",
@@ -194,7 +246,7 @@ def make_apply_rule(
         returns 'failed: <reason>'. On success: returns 'done: <rule_name>'.
         """
         saved_paths: list[str] = []
-        step = 'save'
+        steps = ['save']
         try:
             for item in attachments:
                 filename = item['filename']
@@ -208,42 +260,24 @@ def make_apply_rule(
                 lg.info(
                     'attachment saved', filename=filename, target=str(target.resolve()), status=status, rule=rule_name
                 )
-
-            step = 'reply'
-            full_reply = (
-                reply_body.rstrip()
-                + '\n\n'
-                + _format_reply_body(
-                    rule_name,
-                    saved_paths,
-                    mail_ctx.date_iso,
-                )
-            )
-            gmail.send_reply(mail_ctx, full_reply)
-
-            step = 'mark_read'
-            gmail.mark_read(mail_ctx.id)
-
-            step = 'add_done'
-            gmail.add_label(mail_ctx.id, DONE_LABEL)
-
+            _finish(gmail, mail_ctx, rule_name, reply_body, saved_paths, steps)
             lg.info('rule applied', rule=rule_name, mail_id=mail_ctx.id)
             return f'done: {rule_name}'
 
         except Exception as exc:
-            _fail(gmail, mail_ctx, rule_name, f'apply_rule/{step}', exc)
-            return f'failed: {step}: {type(exc).__name__}: {exc}'
+            _fail(gmail, mail_ctx, rule_name, f'apply_rule/{steps[-1]}', exc)
+            return f'failed: {steps[-1]}: {type(exc).__name__}: {exc}'
 
     return apply_rule
 
 
 def make_apply_downloaded(
-    gmail: GmailClient,
+    gmail: GmailMcp,
     mail_ctx: MailContext,
 ) -> Callable[[str, str, str, str], str]:
     """apply_downloaded for browser-flow rules. Moves a local file (from
     browser_download) to its final ALLOWED_ROOTS path, then mirrors the
-    apply_rule side-effects: reply to NOTIFY_TO, mark read, add done-label."""
+    apply_rule side-effects: confirmation, mark read, add done-label."""
 
     def apply_downloaded(
         source_path: str,
@@ -251,54 +285,33 @@ def make_apply_downloaded(
         reply_body: str,
         rule_name: str,
     ) -> str:
-        step = 'read_source'
+        """Move the downloaded file at source_path to target_path, send one
+        confirmation to HP, mark the mail as read, add the mailprocessor/done label.
+        Returns 'done: <rule_name>' or 'failed: <reason>'."""
+        steps = ['read_source']
         try:
             src = Path(source_path)
             if not src.is_absolute() or not src.exists():
                 raise FileNotFoundError(f'source not found: {source_path}')
             data = src.read_bytes()
 
-            step = 'save'
+            steps.append('save')
             target = Path(target_path)
             status = disk.save_attachment_bytes(target, data)
-            saved_paths = [str(target.resolve())]
             lg.info('downloaded saved', filename=src.name, target=str(target.resolve()), status=status, rule=rule_name)
-
-            step = 'reply'
-            full_reply = (
-                reply_body.rstrip()
-                + '\n\n'
-                + _format_reply_body(
-                    rule_name,
-                    saved_paths,
-                    mail_ctx.date_iso,
-                )
-            )
-            gmail.send_reply(mail_ctx, full_reply)
-
-            step = 'mark_read'
-            gmail.mark_read(mail_ctx.id)
-
-            step = 'add_done'
-            gmail.add_label(mail_ctx.id, DONE_LABEL)
-
-            # Cleanup temp file (best-effort)
-            try:
-                src.unlink()
-            except Exception:
-                pass
-
+            _finish(gmail, mail_ctx, rule_name, reply_body, [str(target.resolve())], steps)
+            src.unlink(missing_ok=True)
             lg.info('rule applied (downloaded)', rule=rule_name, mail_id=mail_ctx.id)
             return f'done: {rule_name}'
 
         except Exception as exc:
-            _fail(gmail, mail_ctx, rule_name, f'apply_downloaded/{step}', exc)
-            return f'failed: {step}: {type(exc).__name__}: {exc}'
+            _fail(gmail, mail_ctx, rule_name, f'apply_downloaded/{steps[-1]}', exc)
+            return f'failed: {steps[-1]}: {type(exc).__name__}: {exc}'
 
     return apply_downloaded
 
 
-def make_wait_for_email(gmail: GmailClient, after_epoch: int) -> Callable:
+def make_wait_for_email(gmail: GmailMcp, after_epoch: int) -> Callable:
     """Bind wait_for_email to a starting timestamp so old mails are ignored."""
 
     def wait_for_email(
@@ -353,7 +366,7 @@ def read_pdf_file(path: str, max_chars: int = 2000) -> str:
 
 
 def make_read_pdf_excerpt(
-    gmail: GmailClient,
+    gmail: GmailMcp,
     mail_ctx: MailContext,
 ) -> Callable[[str, int], str]:
     """Build the read_pdf_excerpt tool closed over gmail + mail_ctx.
@@ -392,17 +405,42 @@ def make_read_pdf_excerpt(
     return read_pdf_excerpt
 
 
-def report_no_action(reason: str) -> str:
-    """Geen actie voor deze mail (geen regel match, of placeholder onvulbaar).
-    Geen labels, mail blijft ongelezen, gelogd voor review.
-    Returnt 'no-action: <reason>'.
-    """
-    lg.info('no action', reason=reason)
-    return f'no-action: {reason}'
+class AgentReportedFailure(Exception):
+    """The agent matched a rule but could not carry it out."""
+
+
+def make_report_no_action(gmail: GmailMcp, mail_ctx: MailContext) -> Callable[[str], str]:
+    """Build report_no_action: labels the mail skipped so it is not offered again."""
+
+    def report_no_action(reason: str) -> str:
+        """Use ONLY when no rule in tasks.md matches this mail. Adds the
+        mailprocessor/skipped label (HP removes it to reprocess).
+        Returns 'no-action: <reason>'."""
+        lg.info('no action', reason=reason, mail_id=mail_ctx.id, subject=mail_ctx.subject)
+        try:
+            gmail.add_label(mail_ctx.id, SKIPPED_LABEL)
+        except Exception as exc:
+            lg.error(f'failed to add skipped-label op {mail_ctx.id}\n', exc_info=exc)
+        return f'no-action: {reason}'
+
+    return report_no_action
+
+
+def make_report_failure(gmail: GmailMcp, mail_ctx: MailContext) -> Callable[[str], str]:
+    """Build report_failure: failed-label plus a Janitor alert, like a failing apply step."""
+
+    def report_failure(reason: str) -> str:
+        """Use when a rule matches but cannot be carried out (button not found,
+        timeout, placeholder unknown, download failed). Adds mailprocessor/failed
+        and alerts HP. Returns 'failed: <reason>'."""
+        _fail(gmail, mail_ctx, '', 'report_failure', AgentReportedFailure(reason))
+        return f'failed: {reason}'
+
+    return report_failure
 
 
 def _fail(
-    gmail: GmailClient,
+    gmail: GmailMcp,
     mail_ctx: MailContext,
     rule_name: str,
     step: str,
@@ -417,7 +455,7 @@ def _fail(
 
 
 async def process_mail(
-    gmail: GmailClient,
+    gmail: GmailMcp,
     mail_ctx: MailContext,
     tasks_md: str,
     *,
@@ -425,9 +463,7 @@ async def process_mail(
 ) -> str:
     """Run the justai agent for one mail; returns the agent's answer."""
     fd, prompt_path_str = tempfile.mkstemp(suffix='.md')
-    import os as _os
-
-    _os.close(fd)
+    os.close(fd)
     prompt_path = Path(prompt_path_str)
     browser = BrowserSession()
     # Anchor wait_for_email to "now" so we only see verification mails that
@@ -449,7 +485,8 @@ async def process_mail(
                 read_pdf_file,
                 make_apply_rule(gmail, mail_ctx),
                 make_apply_downloaded(gmail, mail_ctx),
-                report_no_action,
+                make_report_no_action(gmail, mail_ctx),
+                make_report_failure(gmail, mail_ctx),
                 make_browser_open(browser),
                 make_browser_snapshot(browser),
                 make_browser_click(browser),

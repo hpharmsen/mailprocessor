@@ -7,5 +7,5 @@ __pycache__/
 *.pyc
 .venv/
 launchd/*.log
-/credentials_mcp.json
-/token_mcp.json
+credentials_mcp.json
+token_mcp.json

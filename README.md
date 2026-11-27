@@ -5,30 +5,41 @@ opslaat op disk volgens regels uit `tasks.md`, een justai-agent inzet voor
 rule-matching + placeholder-substitutie, en Gmail-labels gebruikt als enige
 persistente state.
 
+Alle Gmail-toegang loopt via Google's officiële Gmail MCP-server
+(`gmailmcp.googleapis.com/mcp/v1self`). Sinds 1 februari 2027 moeten AI-agents
+op Workspace-data een Google MCP gebruiken (Workspace AI Tools Addendum). De
+enige uitzondering is `src/gmail_rest.py`: de MCP-server kan geen bijlagen
+downloaden, dus bijlage-bytes en de `Message-ID` komen via de REST API, buiten de
+agent om.
+
 ## Setup
 
-### 1. Google Cloud Console (eenmalig)
+### 1. Google Cloud (eenmalig)
 
-1. Cloud Console > nieuw project "mailprocessor" > enable Gmail API.
-2. OAuth consent screen > User type **External** > add `hp@harmsen.nl` als test user.
-3. **Publishing > Publish app**. Status moet "In production" worden,
-   anders verloopt de refresh-token na 7 dagen en sterft de cron stil.
-4. Credentials > Create OAuth client > type **Desktop app** > download als
-   `credentials.json` in deze directory.
+Zie [docs/solutions/integrations/gmail-mcp-setup.md](docs/solutions/integrations/gmail-mcp-setup.md).
+Kort:
+
+- `gcloud services enable gmail.googleapis.com gmailmcp.googleapis.com --project=mailprocessor-499408`
+- Twee Desktop OAuth-clients in de Console, in deze directory:
+  - `credentials_mcp.json` **met** "Use this client for an AI-powered agent".
+    Zonder die vlag weigert de MCP-server het token (`invalid_token`).
+  - `credentials.json` zonder die vlag, voor `gmail_rest.py`.
+- Admin console (admin.google.com) > Agents > Instellingen > Gebruikersbeoordeling
+  voor externe agents: **Toegang tot externe gegevens** op **Toestaan**. Anders
+  ziet de MCP-server geen mail van externe afzenders.
 
 ### 2. Local install
 
 ```bash
-cd /Users/hp/proj/research/mailprocessor
+cd /Users/hp/proj/mailprocessor
 uv sync
 mkdir -p ~/Library/Logs/mailprocessor
 ```
 
 `.env` moet minstens bevatten:
 
-- `NOTIFY_TO` — e-mailadres waar alle replies naartoe gaan.
-- `EMAILME_TOKEN` — shared secret voor de emailme-endpoint. Zonder dit token
-  bereiken foutmeldingen Janitor niet en klaagt de run op stderr.
+- `EMAILME_TOKEN`: shared secret voor de emailme-endpoint. Daarmee gaan zowel
+  de bevestigingen na een opgeslagen factuur als de foutmeldingen naar Janitor.
 
 Overige env-vars (bv. `ODIDO_USER` / `ODIDO_PASSWORD`) zijn alleen nodig voor
 regels die die credentials via `browser_fill_credential` gebruiken.
@@ -39,8 +50,8 @@ regels die die credentials via `browser_fill_credential` gebruiken.
 uv run src/main.py setup-auth
 ```
 
-Opent een browser. Accepteer de "unverified app" warning. `token.json` wordt
-weggeschreven met mode 0600.
+Opent twee keer een browser, één keer per OAuth-client. `token_mcp.json` en
+`token.json` worden weggeschreven met mode 0600.
 
 ### 4. Handmatig testen
 
@@ -51,7 +62,7 @@ uv run src/main.py
 ### 5. Schedulen via `cron` (HP's eigen scheduler)
 
 ```bash
-cron add "0 * * * *" "/Users/hp/proj/research/.venv/bin/python /Users/hp/proj/research/mailprocessor/src/main.py"
+cron add "0 * * * *" "cd /Users/hp/proj/mailprocessor && uv run src/main.py"
 cron list                          # noteer ID
 cron rename <id> Mailprocessor
 cron run <id>                      # forceer een directe run
@@ -81,7 +92,7 @@ Geef `exc_info` toch mee waar je een exception in handen hebt:
 
 ```python
 lg.error('gmail query failed', mail_id=mid, exc_info=exc)
-# subject:  [ERROR] mailprocessor: TimeoutError in gmail_client.py:query_pending
+# subject:  [ERROR] mailprocessor: TimeoutError in gmail_mcp.py:query_pending
 # body:     de melding, de kwargs en de volledige traceback
 
 lg.error('gmail query failed', mail_id=mid, error=str(exc))
@@ -98,15 +109,26 @@ waar ze ontstaan.
 Versie-eisen: `exc_info` op de LogRecord vereist justlog >= 0.8.6, de terugval
 op de logregel >= 0.8.9, en `capture=` eveneens >= 0.8.9.
 
-Gmail-calls lopen via `_execute()` in `gmail_client.py` en retryen transient
-falen (429, 5xx, timeouts, connection resets, DNS-hikken) 3x met oplopende
-backoff. Elke retry is een WARNING; pas als de laatste poging faalt propageert
-de exception en logt de caller één ERROR. Een netwerkblip levert dus geen
-Janitor-alert meer op.
+MCP- en REST-calls lopen via `retry()` in `gmail_mcp.py` en retryen transient
+falen (HTTP-fouten, timeouts, connection resets) 3x met oplopende backoff. Elke
+retry is een WARNING; pas als de laatste poging faalt propageert de exception
+en logt de caller één ERROR. Een netwerkblip levert dus geen Janitor-alert op.
+
+## Labels
+
+| Label | Betekenis | Opnieuw verwerken |
+| --- | --- | --- |
+| `mailprocessor/done` | opgeslagen, bevestiging verstuurd | n.v.t. |
+| `mailprocessor/failed` | regel past, uitvoering mislukt (Janitor-alert) | label verwijderen |
+| `mailprocessor/skipped` | geen regel in `tasks.md` past | label verwijderen |
 
 ## Troubleshooting
 
-- **Token expired / RefreshError** -> Janitor-alert komt binnen. Run `uv run src/main.py setup-auth`.
+- **Token expired / RefreshError / invalid_token** -> Janitor-alert komt binnen. Run `uv run src/main.py setup-auth`.
+- **MCP-server direct bevragen** -> `uv run scripts/mcp_probe.py tools`, `... call <tool> '<json>'`
+  of `... attachments <message_id>` (downloadt de bijlagen zoals mailprocessor dat doet en toont grootte en sha256).
+- **Zoeken geeft `omittedContent: DATA_PROTECTION_POLICY` of "requires user confirmation"** ->
+  de admin-instelling "Toegang tot externe gegevens" staat niet op Toestaan (zie Setup).
 - **Mail met failed-label** -> check `~/Library/Logs/mailprocessor/app.log`, fix
   oorzaak, verwijder het `mailprocessor/failed`-label in Gmail, en kickstart de job.
 - **Cron job lijkt niet te lopen** -> `cron show <id>` toont last_run + status; `cron log <id>` toont laatste output.
