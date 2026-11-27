@@ -202,7 +202,11 @@ def send_confirmation(mail_ctx: MailContext, body: str) -> None:
     req = urllib.request.Request(
         EMAILME_URL,
         data=json.dumps(payload).encode(),
-        headers={'Content-Type': 'application/json', 'X-Emailme-Token': os.environ.get('EMAILME_TOKEN', '')},
+        headers={
+            'Content-Type': 'application/json',
+            'X-Emailme-Token': os.environ.get('EMAILME_TOKEN', ''),
+            'User-Agent': 'mailprocessor/1.0',  # Cloudflare blocks the default Python-urllib agent (403, error 1010)
+        },
         method='POST',
     )
     urllib.request.urlopen(req, timeout=EMAILME_TIMEOUT_SECONDS)
