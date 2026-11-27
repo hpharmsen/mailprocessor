@@ -34,4 +34,4 @@ Als een mail komt van `_noreply@leverancier.nl` met titel "Je factuur staat klaa
 3. Wacht op de verificatiemail met `wait_for_email(sender='_noreply@leverancier.nl', subject_contains='verificatiecode', timeout_seconds=120)`.
 4. Vul de code met `browser_fill`, bevestig.
 5. Download de factuur met `browser_download`.
-6. Roep `apply_downloaded` aan met source_path, target_path, rule_name en reply_body — die markeert de mail als gelezen, stuurt de reply en zet het done-label.
+6. Roep `apply_downloaded` aan met source_path, target_path, rule_name en reply_body — die markeert de mail als gelezen, stuurt de bevestiging en zet het done-label.
