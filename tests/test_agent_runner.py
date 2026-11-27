@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -5,7 +6,7 @@ import pytest
 
 import agent_runner
 import disk
-from gmail_client import MailContext, DONE_LABEL, FAILED_LABEL
+from gmail_mcp import MailContext, DONE_LABEL, FAILED_LABEL, SKIPPED_LABEL
 
 
 def _ctx(tmp_path, filename='Monthly Report May 2026.pdf'):
@@ -25,6 +26,23 @@ def mock_gmail():
     return g
 
 
+@pytest.fixture(autouse=True)
+def emailme(monkeypatch):
+    '''Capture emailme POSTs instead of sending mail; set .fail to make them raise.'''
+    sent = []
+
+    def urlopen(req, timeout):
+        if getattr(urlopen, 'fail', None):
+            raise urlopen.fail
+        sent.append({'url': req.full_url, 'headers': dict(req.header_items()),
+                     'payload': json.loads(req.data)})
+
+    urlopen.sent = sent
+    monkeypatch.setattr(agent_runner.urllib.request, 'urlopen', urlopen)
+    monkeypatch.setenv('EMAILME_TOKEN', 'tok')
+    return urlopen
+
+
 @pytest.fixture
 def mock_lg_error(monkeypatch):
     '''Capture the lg.error calls that JanitorWebhookHandler ships to Janitor.'''
@@ -39,11 +57,11 @@ def relax_allowed_roots(tmp_path, monkeypatch):
 
 
 def test_apply_rule_calls_steps_in_order(
-    mock_gmail, relax_allowed_roots, tmp_path,
+    mock_gmail, relax_allowed_roots, tmp_path, monkeypatch,
 ):
     ctx = _ctx(tmp_path)
     calls = []
-    mock_gmail.send_reply.side_effect = lambda *a, **kw: calls.append('reply')
+    monkeypatch.setattr(agent_runner, 'send_confirmation', lambda *a: calls.append('confirm'))
     mock_gmail.mark_read.side_effect = lambda *a: calls.append('mark_read')
 
     def add_label_side(_mid, label):
@@ -62,14 +80,14 @@ def test_apply_rule_calls_steps_in_order(
         'body', 'leap',
     )
     assert calls == [
-        'download', 'reply', 'mark_read', ('add_label', DONE_LABEL),
+        'download', 'confirm', 'mark_read', ('add_label', DONE_LABEL),
     ]
     assert result == 'done: leap'
     assert target.read_bytes() == b'PDF-BYTES'
 
 
 def test_apply_rule_failure_at_save_adds_failed_label_alerts_and_returns_failed(
-    mock_gmail, mock_lg_error, tmp_path, monkeypatch,
+    mock_gmail, mock_lg_error, tmp_path, monkeypatch, emailme,
 ):
     # ALLOWED_ROOTS unchanged — write to /tmp will trigger PathNotAllowedError
     ctx = _ctx(tmp_path)
@@ -86,16 +104,16 @@ def test_apply_rule_failure_at_save_adds_failed_label_alerts_and_returns_failed(
     message, kwargs = mock_lg_error.call_args[0][0], mock_lg_error.call_args[1]
     assert ctx.subject in message and ctx.id in message
     assert isinstance(kwargs['exc_info'], Exception)
-    mock_gmail.send_reply.assert_not_called()
+    assert emailme.sent == []
     mock_gmail.mark_read.assert_not_called()
     assert result.startswith('failed: save:')
 
 
-def test_apply_rule_failure_at_reply_does_not_mark_read(
-    mock_gmail, mock_lg_error, relax_allowed_roots, tmp_path,
+def test_apply_rule_failure_at_confirm_does_not_mark_read(
+    mock_gmail, mock_lg_error, relax_allowed_roots, tmp_path, emailme,
 ):
     ctx = _ctx(tmp_path)
-    mock_gmail.send_reply.side_effect = RuntimeError('smtp down')
+    emailme.fail = OSError('emailme down')
     apply_rule = agent_runner.make_apply_rule(mock_gmail, ctx)
     result = apply_rule(
         [{'filename': ctx.attachment_filenames[0],
@@ -105,11 +123,13 @@ def test_apply_rule_failure_at_reply_does_not_mark_read(
     mock_gmail.mark_read.assert_not_called()
     mock_gmail.add_label.assert_called_once_with(ctx.id, FAILED_LABEL)
     mock_lg_error.assert_called_once()
-    assert result.startswith('failed: reply:')
+    assert 'apply_rule/confirm' in mock_lg_error.call_args[0][0]
+    assert DONE_LABEL not in [c.args[1] for c in mock_gmail.add_label.call_args_list]
+    assert result.startswith('failed: confirm:')
 
 
-def test_apply_rule_multi_attachment_one_reply(
-    mock_gmail, relax_allowed_roots, tmp_path,
+def test_apply_rule_multi_attachment_one_confirmation(
+    mock_gmail, relax_allowed_roots, tmp_path, emailme,
 ):
     ctx = MailContext(
         id='m1', thread_id='t1', message_id_header='<x@y>',
@@ -126,7 +146,7 @@ def test_apply_rule_multi_attachment_one_reply(
         'body', 'r',
     )
     assert mock_gmail.download_attachment.call_count == 2
-    assert mock_gmail.send_reply.call_count == 1
+    assert len(emailme.sent) == 1
     assert result == 'done: r'
 
 
@@ -143,9 +163,79 @@ def test_apply_rule_unknown_attachment_filename_fails(
     mock_gmail.add_label.assert_called_once_with(ctx.id, FAILED_LABEL)
 
 
-def test_report_no_action_returns_message_does_nothing():
-    result = agent_runner.report_no_action('no match')
+def test_apply_rule_confirmation_goes_to_emailme_in_invoice_thread(
+    mock_gmail, relax_allowed_roots, tmp_path, emailme,
+):
+    ctx = _ctx(tmp_path)
+    target = tmp_path / 'out.pdf'
+    agent_runner.make_apply_rule(mock_gmail, ctx)(
+        [{'filename': ctx.attachment_filenames[0], 'target_path': str(target)}], 'Opgeslagen.', 'leap')
+    (req,) = emailme.sent
+    assert req['url'] == 'https://www.harmsen.nl/emailme/'
+    assert req['headers']['X-emailme-token'] == 'tok'
+    p = req['payload']
+    assert p['subject'] == 'Re: Monthly Report May 2026'
+    assert p['headers'] == {'In-Reply-To': '<x@y>', 'References': '<x@y>'}
+    assert 'leap' in p['body'] and str(target.resolve()) in p['body']
+    assert 'https://mail.google.com/mail/u/0/#inbox/mid-1' in p['body']
+    mock_gmail.mark_read.assert_called_once_with('mid-1')
+    mock_gmail.add_label.assert_called_once_with('mid-1', DONE_LABEL)
+
+
+def test_confirmation_without_message_id_has_no_thread_headers(tmp_path, emailme):
+    ctx = _ctx(tmp_path)
+    ctx.message_id_header = None
+    agent_runner.send_confirmation(ctx, 'body')
+    assert 'headers' not in emailme.sent[0]['payload']
+
+
+def test_confirmation_keeps_existing_re_prefix(tmp_path, emailme):
+    ctx = _ctx(tmp_path)
+    ctx.subject = 'RE: Factuur'
+    agent_runner.send_confirmation(ctx, 'body')
+    assert emailme.sent[0]['payload']['subject'] == 'RE: Factuur'
+
+
+def test_confirmation_body_is_html_escaped(tmp_path, emailme):
+    agent_runner.send_confirmation(_ctx(tmp_path), 'a <b> & c')
+    assert '&lt;b&gt; &amp; c' in emailme.sent[0]['payload']['body']
+
+
+def test_apply_downloaded_confirms_via_emailme(mock_gmail, relax_allowed_roots, tmp_path, emailme):
+    src = tmp_path / 'dl.pdf'
+    src.write_bytes(b'PDF')
+    ctx = _ctx(tmp_path)
+    result = agent_runner.make_apply_downloaded(mock_gmail, ctx)(
+        str(src), str(tmp_path / 'final.pdf'), 'ok', 'odido')
+    assert result == 'done: odido'
+    assert emailme.sent[0]['payload']['headers']['In-Reply-To'] == '<x@y>'
+    mock_gmail.add_label.assert_called_once_with('mid-1', DONE_LABEL)
+    assert not src.exists()
+
+
+def test_apply_rule_identical_existing_file_still_done(mock_gmail, relax_allowed_roots, tmp_path, emailme):
+    ctx = _ctx(tmp_path)
+    target = tmp_path / 'out.pdf'
+    target.write_bytes(b'PDF-BYTES')
+    result = agent_runner.make_apply_rule(mock_gmail, ctx)(
+        [{'filename': ctx.attachment_filenames[0], 'target_path': str(target)}], 'b', 'leap')
+    assert result == 'done: leap'
+
+
+def test_report_no_action_sets_skipped_label_only(mock_gmail, tmp_path):
+    ctx = _ctx(tmp_path)
+    result = agent_runner.make_report_no_action(mock_gmail, ctx)('no match')
     assert result == 'no-action: no match'
+    mock_gmail.add_label.assert_called_once_with(ctx.id, SKIPPED_LABEL)
+
+
+def test_report_failure_sets_failed_label_and_alerts(mock_gmail, mock_lg_error, tmp_path):
+    ctx = _ctx(tmp_path)
+    result = agent_runner.make_report_failure(mock_gmail, ctx)('browser timeout op Download')
+    assert result == 'failed: browser timeout op Download'
+    mock_gmail.add_label.assert_called_once_with(ctx.id, FAILED_LABEL)
+    mock_lg_error.assert_called_once()
+    assert 'browser timeout op Download' in str(mock_lg_error.call_args[1]['exc_info'])
 
 
 def _make_pdf_bytes(text: str) -> bytes:
@@ -271,11 +361,21 @@ def test_process_mail_passes_tools_and_returns_answer(monkeypatch, mock_gmail, t
     names = [t.__name__ for t in captured['tools']]
     assert names == [
         'read_pdf_excerpt', 'read_pdf_file',
-        'apply_rule', 'apply_downloaded', 'report_no_action',
+        'apply_rule', 'apply_downloaded', 'report_no_action', 'report_failure',
         'browser_open', 'browser_snapshot', 'browser_click',
         'browser_fill', 'browser_fill_credential', 'browser_fill_otp',
         'browser_download', 'browser_download_url', 'browser_save_pdf',
         'wait_for_email',
     ]
-    assert agent_runner.report_no_action in captured['tools']
     assert agent_runner.read_pdf_file in captured['tools']
+
+
+def test_tool_results_never_contain_attachment_bytes(mock_gmail, relax_allowed_roots, tmp_path):
+    ctx = _ctx(tmp_path)
+    mock_gmail.download_attachment.return_value = b'SECRET-PDF-BYTES'
+    results = [
+        agent_runner.make_apply_rule(mock_gmail, ctx)(
+            [{'filename': ctx.attachment_filenames[0], 'target_path': str(tmp_path / 'o.pdf')}], 'b', 'r'),
+        agent_runner.make_read_pdf_excerpt(mock_gmail, ctx)(ctx.attachment_filenames[0]),
+    ]
+    assert not any('SECRET-PDF-BYTES' in r or 'U0VDUkVU' in r for r in results)
