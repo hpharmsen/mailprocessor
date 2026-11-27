@@ -53,8 +53,24 @@ Vastgesteld op 27 november 2026 met `scripts/mcp_probe.py` tegen
 | `list_labels` | `{'labels': [{'labelId', 'name', ...}]}` |
 | `create_label` | Geeft `labelId` terug; `mailprocessor/skipped` werd `Label_67` |
 | `update_message_labels` | `addLabelIds` / `removeLabelIds`, ook `UNREAD`; antwoord bevat de nieuwe `labelIds` |
+| Archiveren (`removeLabelIds: ['INBOX']`) | Geweigerd: "requires user confirmation", ook met externe gegevens op Toestaan. `INBOX` toevoegen mag wel. Mailprocessor archiveert niet |
 
 ## Quota
 
 Standard-tier: 5.000 requests per dag, `search_threads` telt als 10. Een run
 zonder nieuwe mail kost één `list_labels` plus één `search_threads`.
+
+## emailme achter Cloudflare
+
+Cloudflare voor `www.harmsen.nl` geeft HTTP 403 met `error code: 1010` op de
+standaard User-Agent van urllib (`Python-urllib/3.x`). Elke POST naar emailme
+heeft daarom een eigen User-Agent nodig; `send_confirmation` stuurt
+`mailprocessor/1.0`, justlog stuurt `justlog-webhook/1.0`.
+
+## Live test 27 november 2026
+
+Anthropic-factuur `1a1d4c9e01f74233` opnieuw verwerkt (done-label eraf, terug
+in de inbox): `identical-already-present`, bevestiging via emailme landde als
+`Re: Your receipt from Anthropic, PBC #2417-2972-3831` in dezelfde Gmail-thread,
+en de mail kreeg weer `mailprocessor/done`. Run van 10 seconden.
+
