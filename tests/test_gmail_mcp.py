@@ -1,7 +1,5 @@
-import base64
 import contextlib
 from datetime import UTC
-from email.message import EmailMessage
 from types import SimpleNamespace
 
 import gmail_mcp
@@ -16,35 +14,48 @@ from gmail_mcp import (
 from mcp import MCPError
 
 PDF = b'%PDF-1.4 invoice bytes \x00\x01\x02'
-CSV = b'a,b\n1,2\n'
 
 
-def raw_mail(
-    sender='Leap <billing@leap.eu>',
+def full_msg(
+    mid='m1',
+    sender='billing@leap.eu',
+    name='Leap',
     subject='Factuur 2026-10',
-    message_id='<abc@leap.eu>',
-    attachments=(('invoice.pdf', PDF),),
-    html=None,
+    attachments=(('invoice.pdf', 'A1'),),
     plain='Hallo, bijgaand de factuur.',
-) -> str:
-    """Build a MIME message and return it base64url-encoded, as the RAW format does."""
-    msg = EmailMessage()
-    msg['From'] = sender
-    msg['To'] = 'hp@harmsen.nl'
-    msg['Subject'] = subject
-    msg['Date'] = 'Mon, 02 Nov 2026 10:00:00 +0100'
-    if message_id:
-        msg['Message-ID'] = message_id
-    if plain is not None:
-        msg.set_content(plain)
+    html=None,
+) -> dict:
+    """A get_message FULL_CONTENT payload as the Gmail MCP server returns it."""
+    payload = {
+        'id': mid,
+        'threadId': 't1',
+        'sender': sender,
+        'addressDisplayNames': [{'displayName': name, 'emailAddress': sender}],
+        'subject': subject,
+        'date': '2026-11-02T09:00:00Z',
+        'labelIds': ['INBOX'],
+        'plaintextBody': plain,
+        'attachments': [{'filename': f, 'id': i, 'mimeType': 'application/pdf', 'partId': '1'} for f, i in attachments],
+    }
     if html is not None:
-        if plain is None:
-            msg.set_content(html, subtype='html')
-        else:
-            msg.add_alternative(html, subtype='html')
-    for name, data in attachments:
-        msg.add_attachment(data, maintype='application', subtype='octet-stream', filename=name)
-    return base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        payload['htmlBody'] = html
+    return payload
+
+
+class FakeRest:
+    """Stands in for GmailRest."""
+
+    def __init__(self, message_id='<abc@leap.eu>'):
+        self._message_id = message_id
+        self.calls: list[tuple] = []
+
+    def attachment(self, message_id: str, attachment_id: str) -> bytes:
+        self.calls.append(('attachment', message_id, attachment_id))
+        return PDF
+
+    def message_id(self, message_id: str) -> str | None:
+        self.calls.append(('message_id', message_id))
+        return self._message_id
 
 
 def ok(payload: dict) -> SimpleNamespace:
@@ -72,14 +83,14 @@ def no_sleep(monkeypatch):
     monkeypatch.setattr(gmail_mcp.time, 'sleep', lambda s: None)
 
 
-def make(handlers: dict) -> tuple[GmailMcp, FakeClient]:
+def make(handlers: dict, rest=None) -> tuple[GmailMcp, FakeClient]:
     fake = FakeClient(handlers)
 
     @contextlib.asynccontextmanager
     async def connect():
         yield fake
 
-    gmail = GmailMcp(connect=connect)
+    gmail = GmailMcp(connect=connect, rest=rest or FakeRest())
     gmail._label_ids = {DONE_LABEL: 'L_done', FAILED_LABEL: 'L_failed', SKIPPED_LABEL: 'L_skip'}
     return gmail, fake
 
@@ -158,93 +169,83 @@ def test_query_pending_empty_senders_makes_no_call():
 # --- get_message / body / attachments ----------------------------------------
 
 
-def test_get_message_builds_mail_context_from_raw():
-    raw = raw_mail(attachments=(('invoice.pdf', PDF), ('data.csv', CSV)))
-    gmail, fake = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw})})
+def test_get_message_builds_mail_context_from_full_content():
+    gmail, fake = make({'get_message': ok(full_msg(attachments=(('invoice.pdf', 'A1'), ('data.csv', 'A2'))))})
     ctx = gmail.get_message('m1')
     gmail.close()
-    assert fake.calls == [('get_message', {'messageId': 'm1', 'messageFormat': 'RAW'})]
+    assert fake.calls == [('get_message', {'messageId': 'm1', 'messageFormat': 'FULL_CONTENT'})]
     assert (ctx.id, ctx.thread_id) == ('m1', 't1')
     assert (ctx.sender_name, ctx.sender_address) == ('Leap', 'billing@leap.eu')
     assert ctx.subject == 'Factuur 2026-10'
-    assert ctx.date_iso == 'Mon, 02 Nov 2026 10:00:00 +0100'
+    assert ctx.date_iso == '2026-11-02T09:00:00Z'
     assert ctx.message_id_header == '<abc@leap.eu>'
     assert ctx.attachment_filenames == ['invoice.pdf', 'data.csv']
-    assert set(ctx.attachment_ids) == {'invoice.pdf', 'data.csv'}
+    assert ctx.attachment_ids == {'invoice.pdf': 'A1', 'data.csv': 'A2'}
 
 
-def test_get_message_without_message_id_gives_none():
-    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw_mail(message_id=None)})})
+@pytest.mark.parametrize('header', [None, '', '<a@b.nl>\r\nBcc: x@y.z', 'no-brackets@b.nl', '<a@b> <c@d>'])
+def test_get_message_drops_missing_or_malformed_message_id(header):
+    gmail, _ = make({'get_message': ok(full_msg())}, rest=FakeRest(message_id=header))
     assert gmail.get_message('m1').message_id_header is None
     gmail.close()
 
 
-def test_get_message_rejects_crlf_in_sender():
-    # A folded header is unfolded by the parser; the real vector is CRLF inside an encoded-word.
-    name = base64.b64encode(b'Evil\r\nBcc: leak@attacker.example').decode()
-    raw = base64.urlsafe_b64encode(
-        f'From: =?utf-8?b?{name}?= <evil@x.com>\r\nSubject: hi\r\n\r\nbody\r\n'.encode()
-    ).decode()
-    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw})})
+@pytest.mark.parametrize('sender', ['evil@x.com\r\nBcc: leak@attacker.example', '', 'not-an-address'])
+def test_get_message_rejects_malformed_sender(sender):
+    gmail, _ = make({'get_message': ok(full_msg(sender=sender))})
     with pytest.raises(InvalidSenderError):
         gmail.get_message('m1')
     gmail.close()
 
 
-def test_get_message_strips_crlf_from_subject():
-    subj = base64.b64encode(b'Factuur\r\nBcc: x@y.z').decode()
-    raw = base64.urlsafe_b64encode(
-        f'From: a@b.nl\r\nSubject: =?utf-8?b?{subj}?=\r\nMessage-ID: <q@b.nl>\r\n\r\nbody\r\n'.encode()
-    ).decode()
-    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw})})
-    assert gmail.get_message('m1').subject == 'Factuur Bcc: x@y.z'
-    gmail.close()
-
-
-def test_get_message_accepts_unencoded_raw():
-    raw = base64.urlsafe_b64decode(raw_mail()).decode()
-    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw})})
-    assert gmail.get_message('m1').sender_address == 'billing@leap.eu'
-    gmail.close()
-
-
-def test_download_attachment_returns_exact_bytes_per_part():
-    raw = raw_mail(attachments=(('invoice.pdf', PDF), ('data.csv', CSV)))
-    gmail, fake = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw})})
+def test_get_message_strips_crlf_from_subject_and_name():
+    gmail, _ = make({'get_message': ok(full_msg(subject='Factuur\r\nBcc: x@y.z', name='Le\r\nap'))})
     ctx = gmail.get_message('m1')
-    assert gmail.download_attachment('m1', ctx.attachment_ids['invoice.pdf']) == PDF
-    assert gmail.download_attachment('m1', ctx.attachment_ids['data.csv']) == CSV
     gmail.close()
-    assert len(fake.calls) == 1, 'RAW is fetched once per message'
+    assert ctx.subject == 'Factuur Bcc: x@y.z'
+    assert ctx.sender_name == 'Le ap'
 
 
-def test_download_attachment_unknown_part_raises():
-    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw_mail()})})
-    with pytest.raises(KeyError):
-        gmail.download_attachment('m1', '9.9')
+def test_get_message_without_attachments_or_display_name():
+    payload = full_msg(attachments=())
+    del payload['addressDisplayNames'], payload['attachments']
+    gmail, _ = make({'get_message': ok(payload)})
+    ctx = gmail.get_message('m1')
+    gmail.close()
+    assert (ctx.sender_name, ctx.attachment_ids) == ('', {})
+
+
+def test_download_attachment_fetches_bytes_via_rest():
+    rest = FakeRest()
+    gmail, fake = make({}, rest=rest)
+    assert gmail.download_attachment('m1', 'A1') == PDF
+    gmail.close()
+    assert rest.calls == [('attachment', 'm1', 'A1')]
+    assert fake.calls == []
+
+
+def test_message_is_fetched_once_per_run():
+    gmail, fake = make({'get_message': ok(full_msg())})
+    gmail.get_message('m1')
+    gmail.get_message_body('m1')
+    gmail.close()
+    assert len(fake.calls) == 1
+
+
+def test_get_message_body_is_plain_text():
+    gmail, _ = make({'get_message': ok(full_msg())})
+    assert gmail.get_message_body('m1') == 'Hallo, bijgaand de factuur.'
     gmail.close()
 
 
-def test_attachment_part_ids_follow_gmail_numbering():
-    # multipart/mixed: [0] = text/plain, [1] = invoice.pdf
-    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw_mail()})})
-    assert gmail.get_message('m1').attachment_ids == {'invoice.pdf': '1'}
-    gmail.close()
-
-
-def test_get_message_body_prefers_plain_text():
-    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw_mail(html='<p>html</p>')})})
-    assert gmail.get_message_body('m1').strip() == 'Hallo, bijgaand de factuur.'
-    gmail.close()
-
-
-def test_get_message_body_converts_html_and_lists_links():
-    html = '<p>Bekijk je factuur</p><a href="https://x.ai/invoice/1">online</a>'
-    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw_mail(plain=None, html=html)})})
+def test_get_message_body_appends_links_from_html():
+    html = '<p>Bekijk</p><a href="https://x.ai/invoice/1">online</a><a href="mailto:a@b.nl">mail</a>'
+    gmail, _ = make({'get_message': ok(full_msg(plain='Bekijk je factuur', html=html))})
     body = gmail.get_message_body('m1')
     gmail.close()
-    assert 'Bekijk je factuur' in body
+    assert body.startswith('Bekijk je factuur')
     assert '- online: https://x.ai/invoice/1' in body
+    assert 'mailto:' not in body
 
 
 # --- labels ------------------------------------------------------------------
@@ -299,11 +300,10 @@ def test_wait_for_email_returns_body_of_newest_after_start(no_sleep):
             msg('new', sender='noreply@odido.nl', date=iso(AFTER + 30)),
         ],
     }
-    raws = {'new': raw_mail(sender='noreply@odido.nl', plain='Je code is 123456', attachments=())}
     gmail, fake = make(
         {
             'search_threads': ok({'threads': [thread]}),
-            'get_message': lambda a: ok({'id': a['messageId'], 'threadId': 't', 'raw': raws[a['messageId']]}),
+            'get_message': lambda a: ok(full_msg(a['messageId'], 'noreply@odido.nl', plain='Je code is 123456')),
         }
     )
     body = gmail.wait_for_email('noreply@odido.nl', 'code', 120, AFTER)
@@ -319,11 +319,10 @@ def test_wait_for_email_hits_on_second_poll(no_sleep):
             ok({'threads': [{'id': 't', 'messages': [msg('new', sender='noreply@odido.nl', date=iso(AFTER + 5))]}]}),
         ]
     )
-    raw = raw_mail(sender='noreply@odido.nl', plain='code 999', attachments=())
     gmail, fake = make(
         {
             'search_threads': lambda a: next(polls),
-            'get_message': ok({'id': 'new', 'threadId': 't', 'raw': raw}),
+            'get_message': ok(full_msg('new', 'noreply@odido.nl', plain='code 999')),
         }
     )
     assert 'code 999' in gmail.wait_for_email('noreply@odido.nl', 'code', 120, AFTER)
