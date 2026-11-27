@@ -12,7 +12,7 @@ execution: code
 ## Goal Capsule
 
 - **Objective:** facturen en rapportages blijven na 1 februari 2027 elk uur automatisch op de juiste plek op disk landen, zonder dat het project onder Google's nieuwe regels voor AI-agents op Workspace-data valt of beperkt wordt.
-- **Means:** alle Gmail-toegang loopt via Google's officiële Gmail MCP-server, met mailprocessor zelf als MCP-client (KTD1, KTD2, KTD3).
+- **Means:** alle Gmail-toegang loopt via Google's officiële Gmail MCP-server, met mailprocessor zelf als MCP-client, behalve bijlage-bytes en de `Message-ID` (KTD1 t/m KTD4).
 - **Authority:** dit plan; bij conflict wint een R op gedrag en een KTD op mechanisme. Google-documentatie die na 26 nov 2026 verandert, gaat voor op de aannames in Sources.
 - **Stop conditions:**
   - U1 toont aan dat bijlage-bytes niet via de MCP-server te krijgen zijn: stop en leg de uitwijkroute uit KTD4 aan de gebruiker voor.
@@ -27,7 +27,7 @@ execution: code
 
 ### Summary
 
-Mailprocessor stopt met het rechtstreeks aanroepen van de Gmail REST API. Een nieuwe module praat met `https://gmailmcp.googleapis.com/mcp/v1self` via de officiële `mcp` Python SDK. De bestaande, afgeschermde agent-tools (`apply_rule`, `read_pdf_excerpt`, `wait_for_email`, enzovoort) blijven bestaan, maar halen hun Gmail-data voortaan via die MCP-client. Bijlagen komen binnen als RAW MIME en worden lokaal uitgepakt, zodat de bytes nooit in de LLM-context komen. De bevestigingsmail na een opgeslagen factuur gaat via de emailme-dienst en landt via `In-Reply-To`/`References` in de Gmail-thread van de factuur. Mails waarop de agent geen actie neemt krijgen een `mailprocessor/skipped`-label.
+Mailprocessor stopt met het rechtstreeks aanroepen van de Gmail REST API. Een nieuwe module praat met `https://gmailmcp.googleapis.com/mcp/v1self` via de officiële `mcp` Python SDK. De bestaande, afgeschermde agent-tools (`apply_rule`, `read_pdf_excerpt`, `wait_for_email`, enzovoort) blijven bestaan, maar halen hun Gmail-data voortaan via die MCP-client. Bijlage-bytes en de `Message-ID` komen via twee REST-calls in `src/gmail_rest.py`, buiten de agent om, omdat de MCP-server ze niet levert; de bytes komen nooit in de LLM-context. De bevestigingsmail na een opgeslagen factuur gaat via de emailme-dienst en landt via `In-Reply-To`/`References` in de Gmail-thread van de factuur. Mails waarop de agent geen actie neemt krijgen een `mailprocessor/skipped`-label.
 
 ### Problem Frame
 
@@ -44,7 +44,7 @@ Daarnaast blijft een mail waarop de agent `report_no_action` kiest zonder label 
 
 **Compliance**
 
-- R1. Geen enkele code in mailprocessor roept nog de Gmail REST API aan; alle Gmail-toegang loopt via `gmailmcp.googleapis.com`.
+- R1. Alle Gmail-toegang loopt via `gmailmcp.googleapis.com`, behalve `messages.attachments.get` en de `Message-ID`-header in `src/gmail_rest.py`. Geen andere module roept de REST API aan.
 - R2. De agent krijgt geen ruwe MCP-tools; hij ziet alleen de bestaande, afgeschermde tools (geen versturen, verwijderen of doorsturen door het model).
 - R3. Bijlage-bytes komen nooit in de LLM-context; ze gaan van de MCP-response via `disk.save_attachment_bytes` naar disk, met de bestaande `ALLOWED_ROOTS`- en vergelijkingsregels.
 
@@ -70,7 +70,7 @@ Daarnaast blijft een mail waarop de agent `report_no_action` kiest zonder label 
 
 - Generieke MCP-client in justai, zodat andere projecten (janitor, golfmeester) dezelfde brug kunnen gebruiken. Trigger: een tweede project heeft MCP nodig.
 - De oude kopie `/Users/hp/proj/research/mailprocessor` opruimen in de research-repo. Trigger: na U6, los van deze repo.
-- Het oude, niet-agentic OAuth-client-ID verwijderen in de Console. Trigger: twee weken stabiel draaien na U6.
+- `src/gmail_rest.py` vervangen door MCP-calls. Trigger: `uv run scripts/mcp_probe.py tools` toont een tool die bijlage-bytes levert, of `get_message` `RAW` accepteert voor mails met bijlagen.
 
 ---
 
@@ -80,8 +80,9 @@ Daarnaast blijft een mail waarop de agent `report_no_action` kiest zonder label 
 
 - KTD1. **Endpoint `/mcp/v1self`, niet `/mcp/v1`.** `/mcp/v1` vraagt bij gevoelige acties goedkeuring via MCP elicitation, en "always allow" werkt alleen interactief en verloopt na 90 dagen. Dat breekt R8. `/mcp/v1self` heeft geen elicitation en bevat alle lees- en label-tools die we nodig hebben; alleen `reply`, `send_message` en `forward` ontbreken (zie KTD5). Volgt uit de Key Decision MCP-route; governs R1, R8.
 - KTD2. **Mailprocessor is zelf de MCP-client, achter de bestaande tool-closures.** Een nieuwe module `src/gmail_mcp.py` biedt dezelfde methoden die `agent_runner` nu van `GmailClient` gebruikt. De agent ziet geen MCP-schema's. Afgewezen: ruwe MCP-tools aan de agent geven (geeft het model schrijfrechten en vergroot het prompt-injectierisico, strijdig met R2), MCP in justai inbouwen (raakt elk project, justai voert tools synchroon uit en heeft geen MCP-pad), en OpenAI's native remote-MCP (justai stuurt alleen `function`-tools door, Google-tokens zouden bij OpenAI belanden, geen elicitation).
-- KTD3. **Ook de deterministische code gaat via MCP.** Het Addendum spreekt van "driven by an AI Agent" en zegt niet dat REST-calls zonder LLM in hetzelfde project buiten schot blijven. De veilige lezing is een enkele client voor alles; daarmee verdwijnt `google-api-python-client` uit de dependencies. Governs R1.
-- KTD4. **Bijlagen via `get_message` met formaat `RAW`, lokaal uitgepakt.** Geen MCP-tool levert bijlage-bytes los; `get_message` geeft per bijlage alleen metadata. `RAW` geeft de volledige MIME-tekst, die Python met de stdlib `email`-parser uitpakt en direct aan `disk.save_attachment_bytes` geeft. De LLM krijgt alleen bestandsnamen en statusregels. Een RAW-bericht bevat geen Gmail-bijlage-ID's, dus `MailContext.attachment_ids` slaat per bestandsnaam het `partId` uit de metadata van `get_message` op; `download_attachment` loopt het geparste RAW-bericht af in Gmail's partId-nummering (`0`, `1`, `1.2`, ...) en geeft de gedecodeerde inhoud van dat deel terug. Of `RAW` de bijlagen volledig en zonder groottebeperking teruggeeft, is niet geverifieerd: U1 bewijst het met een echte factuurmail. Uitwijkroute als het niet werkt: bijlagen downloaden met een REST-call uit deterministische code, buiten de agent om. Dat is de grijze zone van het Addendum en vraagt eerst een besluit van de gebruiker (stop condition). Governs R3.
+- KTD3. **Ook de deterministische code gaat via MCP, waar de server het kan.** Het Addendum spreekt van "driven by an AI Agent" en zegt niet dat REST-calls zonder LLM in hetzelfde project buiten schot blijven. Zoeken, lezen en labels gaan daarom via MCP; alleen wat de server niet levert gaat via REST (KTD4). `google-api-python-client` verdwijnt; de twee REST-calls gaan via `urllib`. Governs R1.
+- KTD4. **Berichten via `get_message` `FULL_CONTENT`; bijlagen en `Message-ID` via REST, buiten de agent.** De MCP-server heeft geen download-tool (ook niet op `/mcp/v1`), weigert `RAW` voor mails met bijlagen en geeft de `Message-ID`-header in geen enkel formaat. `FULL_CONTENT` levert afzender, weergavenaam, onderwerp, datum, `plaintextBody`, `htmlBody` en per bijlage een `id`; dat `id` is de REST-`attachmentId`. `src/gmail_rest.py` doet `messages.attachments.get` en `messages.get?format=metadata&metadataHeaders=Message-ID` met een aparte OAuth-client zonder agent-vlag (`credentials.json`). De agent roept die module nooit aan en ziet alleen bestandsnamen en statusregels. Dit is de grijze zone van het Addendum; HP heeft hiervoor gekozen. Governs R1, R3.
+- KTD4b. **Workspace-admininstelling "Toegang tot externe gegevens" op Toestaan.** Zonder die instelling laat `search_threads` mail van externe afzenders weg (`DATA_PROTECTION_POLICY`) en vraagt `get_message` om goedkeuring via elicitation, wat een cron niet kan. Governs R4.
 - KTD5. **Bevestiging via de emailme-dienst, als antwoord in de factuur-thread.** Op `/mcp/v1self` bestaat versturen niet, en op `/mcp/v1` vraagt het interactieve goedkeuring (KTD1). De bevestiging gaat als JSON-POST naar `https://www.harmsen.nl/emailme/` met `X-Emailme-Token` (`EMAILME_TOKEN` staat al in `.env`). De URL moet de www-variant zijn: `harmsen.nl` antwoordt met een 301 en de redirect maakt van de POST een lege GET, waarna emailme een mail "No subject" verstuurt. Inhoud zoals nu (`_format_reply_body`) plus de Gmail-deeplink, onderwerp `Re: <origineel onderwerp>`, en via het `headers`-veld van emailme `In-Reply-To` en `References` gelijk aan de `Message-ID` van de factuurmail. Gmail zet zo'n mail in de bestaande thread (geverifieerd op 2026-11-27 met een factuur van Apex). emailme zelf hoeft niet te veranderen. Ontbreekt de `Message-ID`, dan gaat de bevestiging zonder die headers en wordt het een losse mail. Governs R5, R8.
 - KTD6. **Een nieuwe Desktop OAuth-client met de agent-vlag, in hetzelfde project.** De MCP-servers weigeren clients zonder "Use this client for an AI-powered agent" (fout `invalid token`). Volgens de release notes kan een client die op 12 nov 2026 niet gemarkeerd was dat niet meer worden; de Cloud Help spreekt dat tegen, dus een nieuwe client is de zekere route. Die vlag zetten kan alleen in de Console: dit is de enige handmatige stap (R7). Het aanzetten van de API gaat met `gcloud services enable gmailmcp.googleapis.com --project=mailprocessor-499408`. Scope blijft `gmail.modify`. Het token komt via de bestaande `InstalledAppFlow` in `setup-auth`; `google-auth` ververst het en de client stuurt het mee als `Authorization: Bearer`. Governs R7.
 - KTD7. **Synchrone brug via een eigen worker-thread met event loop.** De `mcp` SDK is async; justai roept tools synchroon aan (`func(**kwargs)`) binnen een al draaiende loop. `gmail_mcp.py` houdt een MCP-sessie open in een achtergrondthread en biedt synchrone methoden, naar het patroon van `BrowserSession` in `src/browser_tools.py`. Een sessie per run, niet per call.
@@ -102,7 +103,7 @@ flowchart TB
   main --> agent[justai Agent]
   agent -->|afgeschermde tools| tools[apply_rule / read_pdf_excerpt / wait_for_email / report_no_action / report_failure]
   tools --> mcp
-  tools -->|RAW MIME lokaal uitgepakt| disk[disk.save_attachment_bytes]
+  tools -->|bytes via gmail_rest| disk[disk.save_attachment_bytes]
   tools -->|bevestiging, In-Reply-To| emailme[emailme, landt in factuur-thread]
   tools -->|labels done / failed / skipped, UNREAD eraf| mcp
 ```
@@ -128,7 +129,7 @@ stateDiagram-v2
 
 ### Sequencing
 
-U1 is een harde poort: pas als de spike bewijst dat RAW-bijlagen, label-tools en auth werken, begint de bouw. Daarna lineair: client (U2), agent-runner (U3), main en opruimen (U4), docs (U5), live cutover (U6). De oude REST-route blijft draaien tot U6.
+U1 is een harde poort: pas als de spike bewijst dat bijlagen, label-tools en auth werken, begint de bouw. Daarna lineair: client (U2), agent-runner (U3), main en opruimen (U4), docs (U5), live cutover (U6). De oude REST-route blijft draaien tot U6.
 
 ---
 
@@ -171,7 +172,7 @@ U1 is een harde poort: pas als de spike bewijst dat RAW-bijlagen, label-tools en
 - **Files:** `src/gmail_mcp.py` (nieuw), `tests/test_gmail_mcp.py` (nieuw), `tests/fixtures/mcp/` (MCP-responses uit de U1-probe, geanonimiseerd), `pyproject.toml` en `uv.lock` (`mcp` toevoegen, versie gepind).
 - **Approach:**
   1. Een klasse die bij openen het token laadt en ververst, een MCP-sessie start in een worker-thread (KTD7) en bij sluiten netjes afbouwt.
-  2. Methoden: `query_pending` (inclusief `-label:skipped`, met filtering per bericht uit KTD11), `get_message`, `get_message_body`, `download_attachment` (RAW ophalen, MIME uitpakken, het deel met het gevraagde partId teruggeven, KTD4), `ensure_labels` (inclusief skipped), `add_label`, `mark_read`, `wait_for_email` (interval 10 seconden, nieuwste bericht na het starttijdstip). `get_message` vult `message_id_header` in `MailContext` uit het formaat dat U1 vaststelde; als dat `RAW` is, worden alleen de headers geparsed.
+  2. Methoden: `query_pending` (inclusief `-label:skipped`, met filtering per bericht uit KTD11), `get_message`, `get_message_body`, `download_attachment` (via `gmail_rest`, KTD4), `ensure_labels` (inclusief skipped), `add_label`, `mark_read`, `wait_for_email` (interval 10 seconden, nieuwste bericht na het starttijdstip). `get_message` gebruikt `FULL_CONTENT` en vult `message_id_header` via `gmail_rest`.
   3. Labelnamen worden een keer per run naar ID's vertaald, omdat de label-tools ID's verwachten.
   4. De CRLF-check op het From-adres en `InvalidSenderError` verhuizen mee uit `gmail_client.py`.
   5. Retry op tijdelijke fouten (netwerk, 429, 5xx): WARNING per poging, ERROR na de laatste (R9).
@@ -184,7 +185,7 @@ U1 is een harde poort: pas als de spike bewijst dat RAW-bijlagen, label-tools en
   - `get_message` op een normale factuurmail levert een `MailContext` met afzender, onderwerp, datum en bijlage-ID's.
   - `get_message` met een From-header die `\r\n` bevat gooit `InvalidSenderError`.
   - `get_message` levert de `Message-ID` van de mail in `message_id_header`, en `None` als de header ontbreekt.
-  - `download_attachment` op een RAW-fixture met een PDF levert exact de PDF-bytes.
+  - `download_attachment` geeft exact de bytes die `gmail_rest` levert.
   - `download_attachment` op een mail met twee bijlagen levert de juiste bij elk ID.
   - `download_attachment` voor een onbekend ID gooit een duidelijke fout, geen lege bytes.
   - `ensure_labels` maakt ontbrekende labels aan en hergebruikt bestaande.
@@ -263,7 +264,7 @@ U1 is een harde poort: pas als de spike bewijst dat RAW-bijlagen, label-tools en
 - **Goal:** de cron draait op de MCP-route en het verbruik is gecontroleerd.
 - **Requirements:** R4, R5, R6, R8, R9.
 - **Dependencies:** U5.
-- **Files:** geen code; lokaal worden `credentials.json` en `token.json` naar een backup verplaatst.
+- **Files:** geen code; `credentials.json` en `token.json` blijven staan voor `gmail_rest.py`.
 - **Approach:**
   1. Een handmatige run van `uv run src/main.py` met een echte factuurmail in de inbox.
   2. Daarna twee dagen cron-runs volgen in `~/Library/Logs/mailprocessor/app.log` en bij Janitor.
@@ -290,7 +291,7 @@ U1 is een harde poort: pas als de spike bewijst dat RAW-bijlagen, label-tools en
 - R1 tot en met R9 zijn aantoonbaar waar; R1 en R3 met een test of zoekopdracht, R4 tot en met R6 in de live run.
 - `src/gmail_client.py`, de REST-tests en `google-api-python-client` zijn weg.
 - Er staat geen probe- of experimentcode in `src/`; `scripts/mcp_probe.py` blijft alleen als diagnosehulp en wordt in de README genoemd.
-- De oude `credentials.json` en `token.json` staan niet meer in de projectmap.
+- `credentials.json` en `token.json` worden alleen door `gmail_rest.py` gebruikt.
 
 ---
 
@@ -298,7 +299,7 @@ U1 is een harde poort: pas als de spike bewijst dat RAW-bijlagen, label-tools en
 
 | Risico | Gevolg | Mitigatie |
 |---|---|---|
-| RAW levert bijlagen niet volledig of te groot | R3 onhaalbaar via MCP | U1 als poort; uitwijkroute in KTD4 alleen na besluit van HP |
+| Google beschouwt de REST-calls in `gmail_rest.py` als agent-toegang | Standard-quota of contractueel probleem | Twee calls, buiten de agent, eigen OAuth-client; vervangen zodra de MCP-server bijlagen levert |
 | Workspace-beheer blokkeert MCP voor het domein | `403` of `invalid token` | U1 stelt het vast; aanzetten in Admin console, Security, API Controls |
 | Nieuwe agent-client werkt pas na de GA-uitrol (tot 10 dagen) | U1 loopt vertraging op | U1 vroeg starten; ruim voor 1 feb 2027 |
 | `mcp` SDK v2 heeft breaking changes ten opzichte van v1-voorbeelden | Verbindingscode werkt niet | Versie pinnen; de migratiegids volgen |
@@ -310,4 +311,4 @@ U1 is een harde poort: pas als de spike bewijst dat RAW-bijlagen, label-tools en
 - MCP Python SDK: [python-sdk](https://github.com/modelcontextprotocol/python-sdk), [migratiegids v2](https://py.sdk.modelcontextprotocol.io/migration/).
 - Code: `src/agent_runner.py` (toolset en closures), `src/gmail_client.py` (REST-calls, retry, From-guard), `src/browser_tools.py` (`BrowserSession` worker-thread), `src/disk.py` (`ALLOWED_ROOTS`, byte-vergelijking).
 - justai 5.8.6 heeft geen MCP-pad en voert tools synchroon uit (`justai/agent/agent.py`); de OpenAI-route stuurt alleen `function`-tools door (`justai/models/openai_responses.py`).
-- Niet geverifieerd en daarom in U1: volledigheid van RAW-bijlagen, `UNREAD` verwijderen via `update_message_labels`, exacte v2-signatures voor headers in de `mcp` SDK.
+- Vastgesteld in U1: zie `docs/solutions/integrations/gmail-mcp-setup.md`.

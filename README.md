@@ -6,20 +6,27 @@ rule-matching + placeholder-substitutie, en Gmail-labels gebruikt als enige
 persistente state.
 
 Alle Gmail-toegang loopt via Google's officiële Gmail MCP-server
-(`gmailmcp.googleapis.com/mcp/v1self`), niet via de REST API. Sinds 1 februari
-2027 moeten AI-agents op Workspace-data een Google MCP gebruiken (Workspace AI
-Tools Addendum).
+(`gmailmcp.googleapis.com/mcp/v1self`). Sinds 1 februari 2027 moeten AI-agents
+op Workspace-data een Google MCP gebruiken (Workspace AI Tools Addendum). De
+enige uitzondering is `src/gmail_rest.py`: de MCP-server kan geen bijlagen
+downloaden, dus bijlage-bytes en de `Message-ID` komen via de REST API, buiten de
+agent om.
 
 ## Setup
 
 ### 1. Google Cloud (eenmalig)
 
 Zie [docs/solutions/integrations/gmail-mcp-setup.md](docs/solutions/integrations/gmail-mcp-setup.md).
-Kort: `gcloud services enable gmail.googleapis.com gmailmcp.googleapis.com
---project=mailprocessor-499408`, en in de Console een Desktop OAuth-client met
-**"Use this client for an AI-powered agent"**, opgeslagen als
-`credentials_mcp.json` in deze directory. Zonder die vlag weigert de MCP-server
-het token (`invalid_token`).
+Kort:
+
+- `gcloud services enable gmail.googleapis.com gmailmcp.googleapis.com --project=mailprocessor-499408`
+- Twee Desktop OAuth-clients in de Console, in deze directory:
+  - `credentials_mcp.json` **met** "Use this client for an AI-powered agent".
+    Zonder die vlag weigert de MCP-server het token (`invalid_token`).
+  - `credentials.json` zonder die vlag, voor `gmail_rest.py`.
+- Admin console (admin.google.com) > Agents > Instellingen > Gebruikersbeoordeling
+  voor externe agents: **Toegang tot externe gegevens** op **Toestaan**. Anders
+  ziet de MCP-server geen mail van externe afzenders.
 
 ### 2. Local install
 
@@ -43,7 +50,8 @@ regels die die credentials via `browser_fill_credential` gebruiken.
 uv run src/main.py setup-auth
 ```
 
-Opent een browser. `token_mcp.json` wordt weggeschreven met mode 0600.
+Opent twee keer een browser, één keer per OAuth-client. `token_mcp.json` en
+`token.json` worden weggeschreven met mode 0600.
 
 ### 4. Handmatig testen
 
@@ -101,7 +109,7 @@ waar ze ontstaan.
 Versie-eisen: `exc_info` op de LogRecord vereist justlog >= 0.8.6, de terugval
 op de logregel >= 0.8.9, en `capture=` eveneens >= 0.8.9.
 
-MCP-calls lopen via `GmailMcp.call()` in `gmail_mcp.py` en retryen transient
+MCP- en REST-calls lopen via `retry()` in `gmail_mcp.py` en retryen transient
 falen (HTTP-fouten, timeouts, connection resets) 3x met oplopende backoff. Elke
 retry is een WARNING; pas als de laatste poging faalt propageert de exception
 en logt de caller één ERROR. Een netwerkblip levert dus geen Janitor-alert op.
@@ -118,7 +126,9 @@ en logt de caller één ERROR. Een netwerkblip levert dus geen Janitor-alert op.
 
 - **Token expired / RefreshError / invalid_token** -> Janitor-alert komt binnen. Run `uv run src/main.py setup-auth`.
 - **MCP-server direct bevragen** -> `uv run scripts/mcp_probe.py tools`, `... call <tool> '<json>'`
-  of `... raw <message_id>` (toont de bijlagen uit het RAW-bericht met grootte en sha256).
+  of `... attachments <message_id>` (downloadt de bijlagen zoals mailprocessor dat doet en toont grootte en sha256).
+- **Zoeken geeft `omittedContent: DATA_PROTECTION_POLICY` of "requires user confirmation"** ->
+  de admin-instelling "Toegang tot externe gegevens" staat niet op Toestaan (zie Setup).
 - **Mail met failed-label** -> check `~/Library/Logs/mailprocessor/app.log`, fix
   oorzaak, verwijder het `mailprocessor/failed`-label in Gmail, en kickstart de job.
 - **Cron job lijkt niet te lopen** -> `cron show <id>` toont last_run + status; `cron log <id>` toont laatste output.
