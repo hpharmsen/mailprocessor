@@ -26,6 +26,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx2
+from google.auth.exceptions import TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -77,7 +78,16 @@ def load_credentials(token_path: Path) -> Credentials:
     """Load + refresh OAuth credentials. Raises NoValidTokenError if unusable."""
     creds = Credentials.from_authorized_user_file(str(token_path), SCOPES) if token_path.exists() else None
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                creds.refresh(Request())
+                break
+            except TransportError as e:
+                if attempt == RETRY_ATTEMPTS:
+                    lg.error('oauth token refresh failed after retries', attempts=attempt, exc_info=e)
+                    raise
+                lg.warning('oauth token refresh failed, retrying', error=str(e), attempt=attempt)
+                time.sleep(RETRY_BACKOFF_SECONDS)
         _write_token(token_path, creds)
     if not creds or not creds.valid:
         raise NoValidTokenError(f'Run `uv run src/main.py setup-auth` first (token at {token_path}).')
