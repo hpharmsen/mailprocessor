@@ -196,6 +196,12 @@ def test_confirmation_keeps_existing_re_prefix(tmp_path, emailme):
     assert emailme.sent[0]['payload']['subject'] == 'RE: Factuur'
 
 
+def test_confirmation_sends_own_user_agent(tmp_path, emailme):
+    # Cloudflare in front of emailme answers 403 (error 1010) to urllib's default Python-urllib agent.
+    agent_runner.send_confirmation(_ctx(tmp_path), 'body')
+    assert emailme.sent[0]['headers'].get('User-agent') == 'mailprocessor/1.0'
+
+
 def test_confirmation_body_is_html_escaped(tmp_path, emailme):
     agent_runner.send_confirmation(_ctx(tmp_path), 'a <b> & c')
     assert '&lt;b&gt; &amp; c' in emailme.sent[0]['payload']['body']
