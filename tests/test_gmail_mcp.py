@@ -180,12 +180,24 @@ def test_get_message_without_message_id_gives_none():
 
 
 def test_get_message_rejects_crlf_in_sender():
+    # A folded header is unfolded by the parser; the real vector is CRLF inside an encoded-word.
+    name = base64.b64encode(b'Evil\r\nBcc: leak@attacker.example').decode()
     raw = base64.urlsafe_b64encode(
-        b'From: evil@x.com\r\n\tBcc: leak@attacker.example\r\nSubject: hi\r\n\r\nbody\r\n'
+        f'From: =?utf-8?b?{name}?= <evil@x.com>\r\nSubject: hi\r\n\r\nbody\r\n'.encode()
     ).decode()
     gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw})})
     with pytest.raises(InvalidSenderError):
         gmail.get_message('m1')
+    gmail.close()
+
+
+def test_get_message_strips_crlf_from_subject():
+    subj = base64.b64encode(b'Factuur\r\nBcc: x@y.z').decode()
+    raw = base64.urlsafe_b64encode(
+        f'From: a@b.nl\r\nSubject: =?utf-8?b?{subj}?=\r\nMessage-ID: <q@b.nl>\r\n\r\nbody\r\n'.encode()
+    ).decode()
+    gmail, _ = make({'get_message': ok({'id': 'm1', 'threadId': 't1', 'raw': raw})})
+    assert gmail.get_message('m1').subject == 'Factuur Bcc: x@y.z'
     gmail.close()
 
 
